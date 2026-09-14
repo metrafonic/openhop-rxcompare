@@ -273,14 +273,20 @@ def write_csv(R, path):
 # Self-contained: inline SVG, no external assets, so it opens as a local file.
 
 CSS = """
-:root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
+:root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--plane:#efefeb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
 --grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--a:#2a78d6;--b:#eb6834;--good:#006300;--bad:#d03b3b}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--plane:#232322;--ink:#fff;--ink2:#c3c2b7;
 --grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--a:#3987e5;--b:#d95926;--good:#0ca30c;--bad:#e66767}}
-:root[data-theme=dark]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;
+:root[data-theme=dark]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--plane:#232322;--ink:#fff;--ink2:#c3c2b7;
 --grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--a:#3987e5;--b:#d95926;--good:#0ca30c;--bad:#e66767}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px 48px}
-main{max-width:1200px;margin:0 auto}h2{font-size:15px;margin:28px 0 10px;font-weight:600}
+main{max-width:1200px;margin:0 auto}
+section{padding:26px 0 6px;border-top:1px solid var(--grid);margin-top:18px;scroll-margin-top:60px}section.first{border-top:0;margin-top:0;padding-top:4px}
+section>h2{font-size:18px;margin:0 0 4px;font-weight:600;letter-spacing:-.01em}section>p.meta{margin:0 0 16px}
+.topbar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;justify-content:space-between;background:var(--page);padding:10px 0;border-bottom:1px solid var(--grid);margin:0 0 20px}
+.jump{display:flex;flex-wrap:wrap;gap:2px}.jump a{color:var(--ink2);text-decoration:none;padding:5px 10px;border-radius:6px;font-size:13px}.jump a:hover{background:var(--grid);color:var(--ink)}
+.panel{background:var(--plane);border-radius:14px;padding:18px 18px 12px;margin-top:4px}.panel .ctl{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin:0 0 14px}.panel .ctl label{color:var(--ink2);font-size:13px}
+.panel .card{border-color:transparent}.panel .tile{border-color:transparent}
 h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0 14px;font-size:30px;font-weight:600;letter-spacing:-.01em}
 .who .node{display:inline-flex;align-items:baseline;gap:10px;padding-bottom:6px;border-bottom:4px solid}.who .node.a{border-color:var(--a)}.who .node.b{border-color:var(--b)}
 .who .chip{font-size:15px;font-weight:700;line-height:1;color:#fff;padding:5px 7px 4px;border-radius:5px;align-self:center}.who .node.a .chip{background:var(--a)}.who .node.b .chip{background:var(--b)}
@@ -289,7 +295,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 .tile .v .ch{font-size:13px;padding:4px 6px 3px;vertical-align:.25em;margin:0 6px 0 0}.tile .v .ch.b{margin-left:14px}
 .meta{color:var(--ink2);max-width:72ch;margin:0 0 14px;line-height:1.5}
 .sub{color:var(--ink2);margin:0 0 20px;overflow-wrap:anywhere}.sub code{font-size:12px}
-.nav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
+.nav{display:flex;flex-wrap:wrap;gap:6px;margin:0}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .sw{display:inline-block;width:.6em;height:.6em;border-radius:50%;margin-right:.3em;vertical-align:baseline}.sw.a{background:var(--a)}.sw.b{background:var(--b)}
 
@@ -301,6 +307,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
 .top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
 .split{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:8px 0 6px;background:var(--grid)}.split i{display:block;height:100%}
+.meter{display:grid;grid-template-columns:auto 1fr;gap:5px 8px;align-items:center;margin:8px 0 6px}.meter .tr{height:8px;border-radius:4px;background:var(--grid);overflow:hidden}.meter .tr i{display:block;height:100%;border-radius:4px}
 .nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}
 .nodes td,.nodes th{width:1%}.nodes td:last-child{width:auto;text-align:left;font-size:12px;padding-left:18px}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:28px}
 @media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
@@ -317,7 +324,7 @@ th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 .bar{display:inline-block;height:10px;vertical-align:middle;border-radius:0 4px 4px 0}.bar.l{border-radius:4px 0 0 4px}
 .select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:6px;padding:6px 10px;max-width:100%}
 tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}.hit.pick{cursor:pointer}
-details{margin-top:18px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
+details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
 #tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}
 """
 
@@ -697,7 +704,9 @@ def render_html(R, nav="", refresh=0):
              f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
         tile("Decode rate of all transmissions seen",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             f"{union:,} distinct transmissions, {npair:,} of them heard by both."),
+             (f'<div class="meter"><span class="ch a">A</span><div class="tr"><i style="width:{100*rate_a:.1f}%;background:var(--a)"></i></div>'
+              f'<span class="ch b">B</span><div class="tr"><i style="width:{100*rate_b:.1f}%;background:var(--b)"></i></div></div>'
+              f"{union:,} distinct transmissions, {npair:,} of them heard by both.") if union else ""),
         tile("Better SNR on the same packet",
              f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
              f"{split}Tie on {100*ties/npair:.0f}% of matched packets." if npair else ""),
@@ -800,57 +809,77 @@ def render_html(R, nav="", refresh=0):
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
 A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
 Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
-{nav}
-<div class="top">{"".join(tiles)}</div>
-<h2>Per node</h2>
-{node_table}
+<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#matched">Matched</a><a href="#missed">Missed</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
+<section id="overview" class="first">
+<div class="top">{"".join(tiles)}</div>
+<h2 style="margin-top:22px">Per node</h2>
+{node_table}
+</section>
+
+<section id="matched">
 <h2>The same transmission, heard by both</h2>
+<p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
 <div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
-<div class="card"><h3>Δ SNR per packet, B − A</h3><p>{npair:,} matched packets. Positive means {esc(nb)} decoded it cleaner.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)', h=360, marker=(md, f'mean {md:+.2f}'))}</div>
+<div class="card"><h3>Δ SNR per packet, B − A</h3><p>Positive means {esc(nb)} decoded it cleaner.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)', h=360, marker=(md, f'mean {md:+.2f}'))}</div>
 </div>
+</section>
 
+<section id="missed">
 <h2>Packets only one node decoded</h2>
+<p class="meta">{len(A['only']):,} transmissions only {esc(na)} decoded, {len(B['only']):,} only {esc(nb)}.</p>
 <div class="grid2">
 <div class="card"><h3>How weak were they</h3><p>SNR of packets the other node missed. Misses on the left are the other node running out of sensitivity; misses on the right are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
-<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
+<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
 </div>
+</section>
 
+<section id="neighbours">
 <h2>By upstream neighbour</h2>
+<p class="meta">Last hop before this node. Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
 <div class="grid2">
 <div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better. Click a row to explore it.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
 <div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb)}</div>
 </div>
+</section>
 
-<h2 id="explore">Explore a neighbour</h2>
-<p class="meta">Pick an upstream hop, or click a row in the neighbour table. Everything below is that neighbour's packets in this window.</p>
-<p><select id="ex-hop" class="select">{hop_opts}</select></p>
+<section id="explore">
+<h2>Explore a neighbour</h2>
+<p class="meta">Everything in this panel is one neighbour's packets in the current window. Pick one here, or click a row in any neighbour chart or table.</p>
+<div class="panel">
+<div class="ctl"><label for="ex-hop">Neighbour</label><select id="ex-hop" class="select">{hop_opts}</select></div>
 <div id="ex-out"></div>
+</div>
+</section>
 
+<section id="time">
 <h2>Over time</h2>
+<p class="meta">Both nodes, all neighbours, in {R['bucket']//60}-minute buckets.</p>
 <div class="grid2">
 <div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together. {partial}</p>{leg}{cnt_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
 <div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
 <div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise. {partial}</p>{leg}{crc_chart}</div>
 </div>
+</section>
 
+<section id="data">
+<h2>Data</h2>
+<p class="meta">The numbers behind the charts, and the RSSI check.</p>
 <details><summary>RSSI calibration check: why the report compares SNR, not RSSI</summary>
 <div class="grid2" style="margin-top:10px">
 <div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
 <div class="card"><h3>Δ RSSI per packet, B − A</h3><p>A bimodal shape here is a calibration artefact, not antenna gain. Mean {mean(drssi):+.2f} dB.</p>{chart_hist(drssi, -10, 10, 1, '', color='var(--ink2)', h=360)}</div>
 </div></details>
-
 <details open><summary>Per-neighbour table ({len(R['neighbours'])} rows)</summary>
-<p class="meta">Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
 <div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ RSSI</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ SNR (B−A)</th></tr></thead>
 <tbody>{"".join(nrows)}</tbody></table></div></details>
-
 <details><summary>Per-bucket table ({len(bk)} rows)</summary><div class="card wrap"><table><thead><tr><th>bucket</th><th>{esc(na)}</th><th>{esc(nb)}</th><th>both</th><th>Δ RSSI</th><th>Δ SNR</th></tr></thead><tbody>{brows}</tbody></table></div></details>
 <details><summary>All matched packets ({npair} rows)</summary><div class="card wrap"><table><thead><tr><th>time</th><th>hop</th><th>type</th><th>len</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ</th></tr></thead><tbody>{prow}</tbody></table></div></details>
+</section>
 </main><div id="tip"></div><script>window.EXPLORE={explore};</script><script>{JS}</script></body></html>"""
     return doc
 
