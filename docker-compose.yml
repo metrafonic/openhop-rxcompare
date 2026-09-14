@@ -1,7 +1,6 @@
 services:
   rxcompare:
-    build: .
-    image: openhop-rxcompare
+    image: ghcr.io/metrafonic/openhop_compare:latest
     container_name: openhop-rxcompare
     env_file: .env
     environment:
