@@ -632,8 +632,7 @@ def render_html(R, nav=""):
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RX compare · {esc(na)} vs {esc(nb)}</title><style>{CSS}</style></head><body><main>
 <h1>RX comparison: {esc(na)} vs {esc(nb)}</h1>
-<p class="sub">{esc(win)} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} · packets joined by <code>(packet_hash, path_hash)</code> within {MATCH_WINDOW_S:g} s ·
-A = <code>{esc(A['url'])}</code> · B = <code>{esc(B['url'])}</code></p>
+<p class="sub">{esc(win)} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} · packets joined by <code>(packet_hash, path_hash)</code> within {MATCH_WINDOW_S:g} s</p>
 {nav}
 <div class="top">{"".join(tiles)}</div>
 <h2>Per node</h2>
