@@ -16,6 +16,8 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
   which neighbours each node misses
 - **per neighbour**: SNR on each node side by side, so threshold-level neighbours stand out
 - noise floor and CRC errors per node, over the same window
+- an interactive **neighbour explorer**: pick a hop and see every one of its packets over the
+  window on both nodes, plus its decode counts per bucket
 - a self-contained HTML report with hover tooltips, light/dark, phone layout and table views
 
 Upstream hop hashes of different lengths (`DB`, `DB95`, `DB9570` are the same node in openHop

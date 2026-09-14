@@ -307,6 +307,8 @@ table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:ta
 th,td{padding:5px 8px;text-align:right;border-bottom:1px solid var(--grid);white-space:nowrap}th{color:var(--ink2);font-weight:500}
 th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 .bar{display:inline-block;height:10px;vertical-align:middle;border-radius:0 4px 4px 0}.bar.l{border-radius:4px 0 0 4px}
+.select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:6px;padding:6px 10px;max-width:100%}
+tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}
 details{margin-top:18px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
 #tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}
 """
@@ -315,6 +317,65 @@ JS = """
 const tip=document.getElementById('tip');
 document.addEventListener('mousemove',e=>{const t=e.target.closest('[data-tip]');if(!t){tip.style.opacity=0;return}
 tip.textContent=t.dataset.tip;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px';});
+
+// ---- neighbour explorer: per-packet view of one upstream hop, rendered client-side from embedded data
+(function(){
+const EX=window.EXPLORE; if(!EX) return;
+const sel=document.getElementById('ex-hop'), out=document.getElementById('ex-out');
+const NA=EX.na, NB=EX.nb, W=520;
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtT=t=>{const d=new Date(t*1000);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')};
+const fmtTs=t=>{const d=new Date(t*1000);return fmtT(t)+':'+d.getSeconds().toString().padStart(2,'0')};
+const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:NaN;
+const f1=v=>isNaN(v)?'–':v.toFixed(1), f2=v=>isNaN(v)?'–':(v>0?'+':'')+v.toFixed(2);
+function ticks(lo,hi,n){if(hi<=lo)hi=lo+1;const raw=(hi-lo)/n,mag=Math.pow(10,Math.floor(Math.log10(raw)));const step=[1,2,2.5,5,10].map(s=>s*mag).find(s=>s>=raw);const t=[];for(let v=Math.floor(lo/step)*step;v<=hi+1e-9;v+=step)t.push(+v.toFixed(6));return t}
+function frame(h,ml,mb,xlo,xhi,ylo,yhi){const mt=12,mr=12,pw=W-ml-mr,ph=h-mt-mb;return{h,ml,mb,mt,x:v=>ml+(v-xlo)/((xhi-xlo)||1)*pw,y:v=>mt+ph-(v-ylo)/((yhi-ylo)||1)*ph,xlo,xhi,ylo,yhi,right:W-mr,bottom:h-mb}}
+function axes(F,xt,yt,xf,yf,zero){let g='<g class="ax">';for(const t of yt)if(t>=F.ylo&&t<=F.yhi){const y=F.y(t);g+=`<line x1="${F.ml}" x2="${F.right}" y1="${y}" y2="${y}"/><text x="${F.ml-6}" y="${y+4}" text-anchor="end">${yf(t)}</text>`}
+for(const t of xt)if(t>=F.xlo&&t<=F.xhi)g+=`<text x="${F.x(t)}" y="${F.bottom+16}" text-anchor="middle">${xf(t)}</text>`;
+const by=(zero&&F.ylo<=0&&0<=F.yhi)?F.y(0):F.bottom;return g+`<line class="base" x1="${F.ml}" x2="${F.right}" y1="${by}" y2="${by}"/></g>`}
+function timeTicks(a,b){const span=b-a,step=[900,1800,3600,7200,14400,21600,43200,86400].find(s=>span/s<=7);const t=[];for(let v=Math.ceil(a/step)*step;v<=b;v+=step)t.push(v);return t}
+function snrChart(rows){
+  if(!rows.length)return'<p>no packets</p>';
+  const vals=rows.flatMap(r=>[r[2],r[3]]).filter(v=>v!=null);
+  let lo=Math.min(...vals),hi=Math.max(...vals);const pad=(hi-lo)*.1||1;lo-=pad;hi+=pad;
+  const F=frame(300,44,28,EX.start,EX.end,lo,hi);
+  let g=axes(F,timeTicks(EX.start,EX.end),ticks(lo,hi,5),fmtT,v=>(v>0?'+':'')+v,false);
+  for(const r of rows){const x=F.x(r[0]);const both=r[2]!=null&&r[3]!=null;
+    const tipS=`${fmtTs(r[0])}\n${NA}: ${r[2]==null?'missed':r[2].toFixed(2)+' dB'+(r[4]!=null?' ('+r[4]+' dBm)':'')}\n${NB}: ${r[3]==null?'missed':r[3].toFixed(2)+' dB'+(r[5]!=null?' ('+r[5]+' dBm)':'')}`+(both?`\nΔ ${f2(r[3]-r[2])} dB`:'');
+    if(both)g+=`<line x1="${x}" x2="${x}" y1="${F.y(r[2])}" y2="${F.y(r[3])}" stroke="var(--axis)" stroke-width="1.5"/>`;
+    for(const [v,col] of [[r[2],'var(--a)'],[r[3],'var(--b)']]){if(v==null)continue;const y=F.y(v);
+      g+=both?`<circle cx="${x}" cy="${y}" r="4" fill="${col}" stroke="var(--surface)" stroke-width="1.5" pointer-events="none"/>`
+             :`<circle cx="${x}" cy="${y}" r="4.5" fill="var(--surface)" stroke="${col}" stroke-width="2" pointer-events="none"/>`}
+    const ys=[r[2],r[3]].filter(v=>v!=null).map(F.y);
+    g+=`<rect class="hit" x="${x-4}" y="${Math.min(...ys)-6}" width="8" height="${Math.max(...ys)-Math.min(...ys)+12}" data-tip="${esc(tipS)}"/>`}
+  return`<svg viewBox="0 0 ${W} ${F.h}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`}
+function countChart(rows){
+  const n=Math.floor((EX.end-EX.t0)/EX.bucket)+1,ca=new Array(n).fill(0),cb=new Array(n).fill(0);
+  for(const r of rows){const i=Math.min(n-1,Math.max(0,Math.floor((r[0]-EX.t0)/EX.bucket)));if(r[2]!=null)ca[i]++;if(r[3]!=null)cb[i]++}
+  const ts=ca.map((_,i)=>EX.t0+i*EX.bucket),mx=Math.max(1,...ca,...cb);
+  const F=frame(300,44,28,ts[0],ts[n-1]||ts[0]+1,0,mx*1.1);
+  let g=axes(F,timeTicks(ts[0],ts[n-1]),ticks(0,mx,5),fmtT,v=>v,true);
+  for(const [c,col] of [[ca,'var(--a)'],[cb,'var(--b)']]){g+=`<path fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" d="${c.map((v,i)=>(i?'L':'M')+F.x(ts[i])+','+F.y(v)).join('')}"/>`}
+  const half=n>1?(F.x(ts[1])-F.x(ts[0]))/2:20;
+  ts.forEach((t,i)=>{g+=`<rect class="hit" x="${F.x(t)-half}" y="${F.mt}" width="${2*half}" height="${F.bottom-F.mt}" data-tip="${fmtT(t)}\n${esc(NA)}: ${ca[i]}\n${esc(NB)}: ${cb[i]}"/>`;
+    for(const [c,col] of [[ca,'var(--a)'],[cb,'var(--b)']])g+=`<circle cx="${F.x(t)}" cy="${F.y(c[i])}" r="3" fill="${col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>`});
+  return`<svg viewBox="0 0 ${W} ${F.h}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`}
+function render(h){
+  const rows=EX.pk.filter(r=>r[1]===h).sort((a,b)=>a[0]-b[0]);
+  const both=rows.filter(r=>r[2]!=null&&r[3]!=null),oa=rows.filter(r=>r[3]==null),ob=rows.filter(r=>r[2]==null);
+  const sa=mean(both.map(r=>r[2])),sb=mean(both.map(r=>r[3]));
+  const stat=(l,v)=>`<div class="tile"><div class="l">${l}</div><div class="v" style="font-size:20px">${v}</div></div>`;
+  out.innerHTML=`<div class="tiles" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(140px,100%),1fr));gap:12px;margin-bottom:12px">
+    ${stat('Decoded by both',both.length)}${stat('Only <span class="ch a">A</span>',oa.length)}${stat('Only <span class="ch b">B</span>',ob.length)}
+    ${stat('Mean SNR, matched',`<span class="ch a">A</span>${f1(sa)}<span class="ch b" style="margin-left:10px">B</span>${f1(sb)}`)}
+    ${stat('Δ SNR, B − A',f2(sb-sa)+' dB')}</div>
+  <div class="grid2">
+   <div class="card"><h3>Every packet from ${esc(EX.hops[h])}</h3><p>Filled dots joined by a stem: decoded by both. Hollow ring: decoded by one node only. Hover for values.</p>${EX.leg}${snrChart(rows)}</div>
+   <div class="card"><h3>Decoded per ${EX.bucket/60} min</h3><p>How many of this neighbour's packets each node decoded.</p>${EX.leg}${countChart(rows)}</div></div>`}
+sel.addEventListener('change',()=>render(+sel.value));
+document.querySelectorAll('[data-hop]').forEach(el=>el.addEventListener('click',()=>{const i=EX.hops.indexOf(el.dataset.hop);if(i<0)return;sel.value=i;render(i);document.getElementById('explore').scrollIntoView({behavior:'smooth',block:'start'})}));
+render(+sel.value);
+})();
 """
 
 
@@ -593,7 +654,7 @@ def render_html(R, nav=""):
     """Return the full report page. `nav` is optional HTML placed under the title (range links)."""
     A, B, pairs = R["A"], R["B"], R["pairs"]
     na, nb = A["name"], B["name"]
-    canon = hop_canon({p.get("upstream_hash") for p, _ in pairs})
+    canon = hop_canon({p.get("upstream_hash") for p, _ in pairs} | {p.get("upstream_hash") for p in A["only"]} | {q.get("upstream_hash") for q in B["only"]})
     hopname = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
     drssi, dsnr = R["drssi"], R["dsnr"]
     npair = len(pairs)
@@ -671,6 +732,16 @@ def render_html(R, nav=""):
         if lst:
             excl_note += (f'<p style="margin-top:10px"><b>Never decoded by the other node:</b> only {esc(n_)} hears '
                           + ", ".join(f"{esc(x['hop'])} ({x['a'] + x['b']})" for x in lst) + "</p>")
+    # ---- explorer data: one row per transmission [ts, hop index, snrA, snrB, rssiA, rssiB]
+    hops = [n["hop"] for n in R["neighbours"]]
+    hidx = {h: i for i, h in enumerate(hops)}
+    pk = [[round(p["timestamp"], 1), hidx[hopname(p)], p["snr"], q["snr"], p["rssi"], q["rssi"]] for p, q in pairs]
+    pk += [[round(p["timestamp"], 1), hidx[hopname(p)], p["snr"], None, p["rssi"], None] for p in A["only"]]
+    pk += [[round(q["timestamp"], 1), hidx[hopname(q)], None, q["snr"], None, q["rssi"]] for q in B["only"]]
+    explore = json.dumps({"hops": hops, "pk": pk, "start": R["start"], "end": R["end"], "t0": R["buckets"][0]["t"] if R["buckets"] else R["start"],
+                          "bucket": R["bucket"], "na": na, "nb": nb, "leg": leg}, separators=(",", ":")).replace("</", "<\\/")
+    hop_opts = "".join(f'<option value="{i}">{esc(n["hop"])} ({n["both"] + n["a"] + n["b"]} packets)</option>' for i, n in enumerate(R["neighbours"]))
+
     # ---- neighbour table
     nrows = []
     mxd = max([abs(n["dsnr"]) for n in R["neighbours"] if n["dsnr"] == n["dsnr"]] or [1])
@@ -682,7 +753,7 @@ def render_html(R, nav=""):
             dcell = f'{n["dsnr"]:+.2f} {bar}'
         else:
             dcell = "–"
-        nrows.append(f"<tr><td>{esc(n['hop'])}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>"
+        nrows.append(f"<tr data-hop=\"{esc(n['hop'])}\" class=\"pick\"><td>{esc(n['hop'])}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>"
                      f"<td>{fmt(n['rssi_a'],0,1)}</td><td>{fmt(n['rssi_b'],0,1)}</td><td>{fmt(n['drssi'],0,1)}</td>"
                      f"<td>{fmt(n['snr_a'],0,2)}</td><td>{fmt(n['snr_b'],0,2)}</td><td>{dcell}</td></tr>")
 
@@ -728,6 +799,11 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb)}</div>
 </div>
 
+<h2 id="explore">Explore a neighbour</h2>
+<p class="meta">Pick an upstream hop, or click a row in the neighbour table. Everything below is that neighbour's packets in this window.</p>
+<p><select id="ex-hop" class="select">{hop_opts}</select></p>
+<div id="ex-out"></div>
+
 <h2>Over time</h2>
 <div class="grid2">
 <div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together.</p>{leg}{cnt_chart}</div>
@@ -751,7 +827,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <details><summary>Per-bucket table ({len(bk)} rows)</summary><div class="card wrap"><table><thead><tr><th>bucket</th><th>{esc(na)}</th><th>{esc(nb)}</th><th>both</th><th>Δ RSSI</th><th>Δ SNR</th></tr></thead><tbody>{brows}</tbody></table></div></details>
 <details><summary>All matched packets ({npair} rows)</summary><div class="card wrap"><table><thead><tr><th>time</th><th>hop</th><th>type</th><th>len</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ</th></tr></thead><tbody>{prow}</tbody></table></div></details>
-</main><div id="tip"></div><script>{JS}</script></body></html>"""
+</main><div id="tip"></div><script>window.EXPLORE={explore};</script><script>{JS}</script></body></html>"""
     return doc
 
 
