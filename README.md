@@ -9,11 +9,16 @@ side, both in no-TX mode.
 It pulls packet history from each node's openHop API, joins the packets that both nodes
 heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 
-- **SNR advantage** per packet, per upstream neighbour and over time (the fair metric —
-  RSSI is calibrated differently per radio and is shown but flagged as such)
-- packets **only one node** decoded, and how weak they were (sensitivity vs. collisions)
-- noise floor and CRC error counts per node
-- a self-contained HTML report with hover tooltips, light/dark, and table views
+- **decode rate**: of every transmission at least one node heard, the share each node decoded
+- **SNR advantage** per packet (with a confidence interval), per upstream neighbour and over
+  time (the fair metric — RSSI is calibrated differently per radio and is shown but flagged as such)
+- packets **only one node** decoded, and how weak they were (sensitivity vs. collisions), plus
+  neighbours that only one node ever hears
+- noise floor and CRC errors per node, over the same window
+- a self-contained HTML report with hover tooltips, light/dark, phone layout and table views
+
+Upstream hop hashes of different lengths (`DB`, `DB95`, `DB9570` are the same node in openHop
+paths) are merged so each neighbour appears once.
 
 ![report](docs/report.png)
 

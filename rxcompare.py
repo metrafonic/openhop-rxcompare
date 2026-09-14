@@ -61,6 +61,13 @@ class Node:
     def crc(self, hours):
         return self.get("crc_error_count", hours=hours)["data"]["crc_error_count"]
 
+    def crc_history(self, hours):
+        try:
+            h = self.get("crc_error_history", hours=hours)["data"]["history"]
+        except Exception:
+            return []
+        return [(x["timestamp"], x["count"]) for x in h if x.get("count") is not None]
+
 
 # --------------------------------------------------------------------------- analysis
 
@@ -91,6 +98,17 @@ def match(pa, pb):
     return pairs, only_a, only_b
 
 
+def hop_canon(hashes):
+    """Map each hop hash to the longest observed hash it is a prefix of, when that is unambiguous."""
+    hs = sorted({h for h in hashes if h}, key=len, reverse=True)
+    out = {}
+    for h in hs:
+        longer = [x for x in hs if len(x) > len(h) and x.startswith(h)]
+        roots = {out.get(x, x) for x in longer}
+        out[h] = roots.pop() if len(roots) == 1 else h
+    return out
+
+
 def mean(xs):
     return st.fmean(xs) if xs else NAN
 
@@ -117,21 +135,28 @@ def analyze(A, B, hours):
     h = max(1, int(math.ceil(hours)))
     na, nb = A.noise(h), B.noise(h)
     na = [x for x in na if x[0] >= start]; nb = [x for x in nb if x[0] >= start]
+    ca, cb = A.crc_history(h), B.crc_history(h)
+    # the history endpoint caps at 1000 samples; if the cap truncated the window, mark the count as a lower bound
+    crc_trunc = {"A": len(ca) >= 1000 and ca and ca[0][0] > start, "B": len(cb) >= 1000 and cb and cb[0][0] > start}
+    ca = [x for x in ca if x[0] >= start]; cb = [x for x in cb if x[0] >= start]
 
     ra = [p["rssi"] for p, _ in pairs]; rb = [q["rssi"] for _, q in pairs]
     sa = [p["snr"] for p, _ in pairs];  sb = [q["snr"] for _, q in pairs]
     drssi = [b - a for a, b in zip(ra, rb)]
     dsnr = [b - a for a, b in zip(sa, sb)]
 
-    # per upstream neighbour (last hop)
+    # per upstream neighbour (last hop). Path hashes are 1-3 bytes of the same node id, so
+    # "DB", "DB95" and "DB9570" are one neighbour: fold each hash into the longest one it prefixes.
+    canon = hop_canon({p.get("upstream_hash") for p in pa} | {q.get("upstream_hash") for q in pb})
+    hop = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
     nb_stats = defaultdict(lambda: {"both": 0, "a": 0, "b": 0, "ra": [], "rb": [], "sa": [], "sb": []})
     for p, q in pairs:
-        s = nb_stats[p.get("upstream_hash") or "?"]
+        s = nb_stats[hop(p)]
         s["both"] += 1; s["ra"].append(p["rssi"]); s["rb"].append(q["rssi"]); s["sa"].append(p["snr"]); s["sb"].append(q["snr"])
     for p in only_a:
-        nb_stats[p.get("upstream_hash") or "?"]["a"] += 1
+        nb_stats[hop(p)]["a"] += 1
     for q in only_b:
-        nb_stats[q.get("upstream_hash") or "?"]["b"] += 1
+        nb_stats[hop(q)]["b"] += 1
     neighbours = []
     for hop, s in sorted(nb_stats.items(), key=lambda kv: -(kv[1]["both"] + kv[1]["a"] + kv[1]["b"])):
         neighbours.append({"hop": hop, "both": s["both"], "a": s["a"], "b": s["b"],
@@ -166,9 +191,9 @@ def analyze(A, B, hours):
     return {
         "generated": time.time(), "start": start, "end": end, "bucket": bucket,
         "A": {"name": A.name, "url": A.url, "n": len(pa), "only": only_a, "rssi": ra, "snr": sa,
-              "noise": na, "crc": A.crc(h)},
+              "noise": na, "crc": sum(c for _, c in ca), "crc_lower_bound": bool(crc_trunc["A"]), "crc_hist": ca},
         "B": {"name": B.name, "url": B.url, "n": len(pb), "only": only_b, "rssi": rb, "snr": sb,
-              "noise": nb, "crc": B.crc(h)},
+              "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types,
     }
@@ -251,14 +276,20 @@ main{max-width:1200px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}h2{font-siz
 .sub{color:var(--ink2);margin:0 0 20px;overflow-wrap:anywhere}.sub code{font-size:12px}
 .nav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
 .legend{display:flex;gap:18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr));gap:12px}.tile.hero{grid-column:span 2}
-@media(max-width:480px){.tile.hero{grid-column:span 1}}
+
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
 .tile .v.hero{font-size:38px}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
+.top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
+.split{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:8px 0 6px;background:var(--grid)}.split i{display:block;height:100%}
+.nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}
+.nodes td,.nodes th{width:1%}.nodes td:last-child{width:auto;text-align:left;font-size:12px;padding-left:18px}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:28px}
+@media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
+.nodes .sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}
-.card h3{font-size:13px;font-weight:600;margin:0 0 2px}.card p{margin:0 0 8px;color:var(--ink2);font-size:12px}
+.card h3{font-size:13px;font-weight:600;margin:0 0 2px}.card p{margin:0 0 8px;color:var(--ink2);font-size:12px}.card .legend{margin:0 0 8px;font-size:12px}
 svg{display:block;width:100%;height:auto;overflow:visible}
 .ax text{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.ax line{stroke:var(--grid)}.ax .base{stroke:var(--axis)}
 .lbl{fill:var(--ink2);font-size:11px}
@@ -435,7 +466,7 @@ def chart_lines(series, ts, yfmt=lambda v: f"{v:g}", zero=False, ylo=None, yhi=N
     s = Svg(w=520, h=220, ml=44)
     s.scales(ts[0], ts[-1] if ts[-1] > ts[0] else ts[0] + 1, lo, hi)
     span = ts[-1] - ts[0]
-    step = 900 if span <= 3 * 3600 else 3600 if span <= 14 * 3600 else 4 * 3600
+    step = next(st_ for st_ in (900, 1800, 3600, 7200, 4 * 3600, 6 * 3600, 12 * 3600, 86400) if span / st_ <= 7)
     xt = [t for t in range(int(ts[0] - ts[0] % step + step), int(ts[-1]) + 1, step)]
     s.axes(xt, nice_ticks(lo, hi, 5), xfmt=tlabel, yfmt=yfmt, y0=zero)
     for name, col, vs in series:
@@ -493,6 +524,8 @@ def render_html(R, nav=""):
     """Return the full report page. `nav` is optional HTML placed under the title (range links)."""
     A, B, pairs = R["A"], R["B"], R["pairs"]
     na, nb = A["name"], B["name"]
+    canon = hop_canon({p.get("upstream_hash") for p, _ in pairs})
+    hopname = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
     drssi, dsnr = R["drssi"], R["dsnr"]
     npair = len(pairs)
     nz_a = [v for _, v in A["noise"]]; nz_b = [v for _, v in B["noise"]]
@@ -501,27 +534,43 @@ def render_html(R, nav=""):
     win = f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(R['start']))} → {time.strftime('%H:%M', time.localtime(R['end']))} ({span_h:.1f} h)"
     leg = f'<div class="legend"><span><i style="background:var(--a)"></i>{esc(na)} (A)</span><span><i style="background:var(--b)"></i>{esc(nb)} (B)</span></div>'
 
-    # ---- tiles
+    # ---- headline row + per-node table
     weak_a = sum(1 for v in A['snr'] + [p['snr'] for p in A['only']] if v < -5)
     weak_b = sum(1 for v in B['snr'] + [p['snr'] for p in B['only']] if v < -5)
+    union = npair + len(A["only"]) + len(B["only"])
+    rate_a = A["n"] / union if union else NAN; rate_b = B["n"] / union if union else NAN
     md = mean(dsnr)
+    ci = 1.96 * st.pstdev(dsnr) / math.sqrt(npair) if npair > 1 else NAN
     lead = nb if md > 0 else na
+    ties = npair - better_a - better_b
+    split = (f'<div class="split"><i style="width:{100*better_a/npair:.1f}%;background:var(--a)"></i>'
+             f'<i style="width:{100*ties/npair:.1f}%"></i><i style="width:{100*better_b/npair:.1f}%;background:var(--b)"></i></div>') if npair else ""
     tiles = [
         tile("Mean SNR advantage (B − A)", f"{md:+.2f} dB" if npair else "–",
-             f"{esc(lead)} hears cleaner on average · median {med(dsnr):+.2f}" if npair else "", hero=True),
-        tile("Matched packets", f"{npair:,}", f"of {A['n']:,} / {B['n']:,} heard"),
-        tile(f"Heard only by {na}", f"{len(A['only']):,}",
-             f"avg SNR {mean([p['snr'] for p in A['only']]):.1f} dB" if A["only"] else ""),
-        tile(f"Heard only by {nb}", f"{len(B['only']):,}",
-             f"avg SNR {mean([p['snr'] for p in B['only']]):.1f} dB" if B["only"] else ""),
-        tile("Better SNR per packet", f"{100*better_b/npair:.0f}%" if npair else "–",
-             f"{esc(nb)} · {esc(na)} {100*better_a/npair:.0f}% · tie {100*(npair-better_a-better_b)/npair:.0f}%" if npair else ""),
-        tile("Weak packets heard (SNR < −5 dB)", f"{weak_a:,} / {weak_b:,}",
-             f"{esc(na)} / {esc(nb)} · the sensitivity headline"),
-        tile("Mean RSSI delta (B − A)", f"{mean(drssi):+.2f} dB" if npair else "–", "calibration-dependent; see scatter"),
-        tile("Noise floor", f"{mean(nz_a):.1f} / {mean(nz_b):.1f}", f"{esc(na)} / {esc(nb)} dBm avg"),
-        tile("CRC errors", f"{A['crc']:,} / {B['crc']:,}", f"{esc(na)} / {esc(nb)}, last {max(1, math.ceil(span_h))} h"),
+             f"{esc(lead)} decodes cleaner on average · 95% CI ±{ci:.2f} · median {med(dsnr):+.2f}" if npair else "", hero=True),
+        tile("Decode rate of all transmissions seen", f"{100*rate_a:.1f}% / {100*rate_b:.1f}%" if union else "–",
+             f"{esc(na)} / {esc(nb)} · {union:,} distinct transmissions, {npair:,} heard by both"),
+        tile("Which node had the better SNR, per matched packet",
+             f"{100*better_a/npair:.0f}% <span style=\"color:var(--ink2);font-weight:400\">·</span> {100*better_b/npair:.0f}%" if npair else "–",
+             f"{split}{esc(na)} · {esc(nb)} · tie {100*ties/npair:.0f}%" if npair else ""),
     ]
+    def row(k, va, vb, tip=""):
+        return f'<tr><td class="k">{k}</td><td>{va}</td><td>{vb}</td><td class="k">{tip}</td></tr>'
+    def wins(x, y, higher_better=True):
+        return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
+    node_rows = "".join([
+        row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}"),
+        row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "the other node missed these"),
+        row("… avg SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low = the other node's sensitivity limit; high = collisions/timing"),
+        row("Weak packets decoded (SNR < −5 dB)", f"{weak_a:,}", f"{weak_b:,}", "sensitivity at the margin"),
+        row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB"),
+        row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio — see scatter"),
+        row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm", "node's own measurement"),
+        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}", "in this window — detected preambles that failed to decode"),
+    ])
+    node_table = (f'<div class="card wrap"><table class="nodes"><thead><tr><th></th>'
+                  f'<th><span class="sw" style="background:var(--a)"></span>{esc(na)}</th>'
+                  f'<th><span class="sw" style="background:var(--b)"></span>{esc(nb)}</th><th></th></tr></thead><tbody>{node_rows}</tbody></table></div>')
 
     # ---- time series
     bk = R["buckets"]
@@ -531,16 +580,27 @@ def render_html(R, nav=""):
     dsnr_chart = chart_lines([("Δ SNR (B−A)", "var(--ink2)", [b["dsnr"] for b in bk])], ts,
                              yfmt=lambda v: f"{v:+.2f}", zero=True)
 
-    def nz_series(pts):
-        # average noise samples into the same buckets
+    def bucketed(pts, agg):
+        # fold (timestamp, value) samples into the packet buckets
         acc = defaultdict(list)
         for t, v in pts:
             i = min(len(bk) - 1, max(0, int((t - ts[0]) // R["bucket"])))
             acc[i].append(v)
-        return [mean(acc[i]) if i in acc else NAN for i in range(len(bk))]
+        return [agg(acc[i]) if i in acc else NAN for i in range(len(bk))]
+    nz_series = lambda pts: bucketed(pts, mean)
+    crc_chart = chart_lines([(na, "var(--a)", bucketed(A["crc_hist"], sum)), (nb, "var(--b)", bucketed(B["crc_hist"], sum))], ts,
+                            yfmt=lambda v: f"{v:g}", zero=True)
     noise_chart = chart_lines([(na, "var(--a)", nz_series(A["noise"])), (nb, "var(--b)", nz_series(B["noise"]))], ts,
                               yfmt=lambda v: f"{v:.1f}")
 
+    # ---- neighbours heard by only one node
+    ex_a = [n for n in R["neighbours"] if n["both"] == 0 and n["a"] >= 3 and n["b"] == 0]
+    ex_b = [n for n in R["neighbours"] if n["both"] == 0 and n["b"] >= 3 and n["a"] == 0]
+    excl_note = ""
+    for n_, lst in ((na, ex_a), (nb, ex_b)):
+        if lst:
+            excl_note += (f'<p style="margin-top:10px"><b>Heard only by {esc(n_)}</b> (never decoded by the other node): '
+                          + ", ".join(f"{esc(x['hop'])} ({x['a'] + x['b']})" for x in lst) + "</p>")
     # ---- neighbour table
     nrows = []
     mxd = max([abs(n["dsnr"]) for n in R["neighbours"] if n["dsnr"] == n["dsnr"]] or [1])
@@ -561,24 +621,26 @@ def render_html(R, nav=""):
                     f"<td>{fmt(b['drssi'],0,2)}</td><td>{fmt(b['dsnr'],0,2)}</td></tr>" for b in bk)
 
     # ---- matched pairs table (collapsed)
-    prow = "".join(f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(p['timestamp']))}</td><td>{esc(p.get('upstream_hash') or '?')}</td>"
+    prow = "".join(f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(p['timestamp']))}</td><td>{esc(hopname(p))}</td>"
                    f"<td>{p['type']}</td><td>{p['length']}</td><td>{p['rssi']}</td><td>{q['rssi']}</td><td>{q['rssi']-p['rssi']:+d}</td>"
                    f"<td>{p['snr']:.2f}</td><td>{q['snr']:.2f}</td><td>{q['snr']-p['snr']:+.2f}</td></tr>"
                    for p, q in sorted(pairs, key=lambda pq: -pq[0]["timestamp"]))
 
     only_a_snr = [p["snr"] for p in A["only"]]; only_b_snr = [p["snr"] for p in B["only"]]
-    meta = [p.get("upstream_hash") or "?" for p, _ in pairs]
+    meta = [hopname(p) for p, _ in pairs]
 
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RX compare · {esc(na)} vs {esc(nb)}</title><style>{CSS}</style></head><body><main>
 <h1>RX comparison: {esc(na)} vs {esc(nb)}</h1>
 <p class="sub">{esc(win)} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} · packets joined by <code>(packet_hash, path_hash)</code> within {MATCH_WINDOW_S:g} s ·
 A = <code>{esc(A['url'])}</code> · B = <code>{esc(B['url'])}</code></p>
-{nav}{leg}
-<div class="tiles">{"".join(tiles)}</div>
+{nav}
+<div class="top">{"".join(tiles)}</div>
+<h2>Per node</h2>
+{node_table}
 
 <h2>Matched packets — same transmission heard by both</h2>
-<div class="grid">
+<div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal = {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
 <div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves — compare SNR instead.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
 <div class="card"><h3>Δ SNR distribution (B − A)</h3><p>Positive = {esc(nb)} better. {npair} packets.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)')}</div>
@@ -587,18 +649,20 @@ A = <code>{esc(A['url'])}</code> · B = <code>{esc(B['url'])}</code></p>
 
 <h2>Packets only one node heard</h2>
 <div class="grid">
-<div class="card"><h3>SNR of exclusive packets</h3><p>Where the other node missed the packet. Weak-signal misses (left) are sensitivity; strong-signal misses (right) are collisions or timing.</p>{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
-<div class="card"><h3>Δ SNR per upstream neighbour (B − A)</h3><p>Averaged over matched packets, last hop with ≥3 matches. Bar colour = the node that hears that neighbour better.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
+<div class="card"><h3>SNR of exclusive packets</h3><p>Where the other node missed the packet. Weak-signal misses (left) are sensitivity; strong-signal misses (right) are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
+<div class="card"><h3>Δ SNR per upstream neighbour (B − A)</h3><p>Averaged over matched packets, last hop with ≥3 matches. Bar colour = the node that hears that neighbour better.</p>{chart_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
 </div>
 
 <h2>Over time</h2>
-<div class="grid">
-<div class="card"><h3>Packets received per {R['bucket']//60} min</h3><p>Includes both matched and exclusive packets.</p>{cnt_chart}</div>
+<div class="grid2">
+<div class="card"><h3>Packets received per {R['bucket']//60} min</h3><p>Includes both matched and exclusive packets.</p>{leg}{cnt_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min (B − A)</h3><p>Should be flat; a drift points at a hardware/temperature/interference change on one side.</p>{dsnr_chart}</div>
-<div class="card"><h3>Noise floor (dBm)</h3><p>From each node's own measurements. Offset between them is partly RSSI calibration.</p>{noise_chart}</div>
+<div class="card"><h3>Noise floor (dBm)</h3><p>From each node's own measurements. Offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
+<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors with the same decode count usually means the radio is hearing further out into the noise.</p>{leg}{crc_chart}</div>
 </div>
 
 <h2>Per upstream neighbour</h2>
+<p class="sub" style="margin:-4px 0 10px">Path hashes of different lengths that refer to the same node (e.g. <code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
 <div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ RSSI</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ SNR (B−A)</th></tr></thead>
 <tbody>{"".join(nrows)}</tbody></table></div>
