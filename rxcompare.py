@@ -184,6 +184,14 @@ def analyze(A, B, hours):
         buckets[bi(q["timestamp"])]["b"] += 1
     for b in buckets:
         b["dsnr"] = mean(b["dsnr"]); b["drssi"] = mean(b["drssi"])
+    # the last bucket is only partly elapsed: scale its counts to a full-bucket rate so the line doesn't dip
+    last = buckets[-1]
+    last["frac"] = max(0.0, min(1.0, (end - last["t"]) / bucket))
+    if last["frac"] < 0.15 and len(buckets) > 1:
+        buckets.pop()
+    elif last["frac"] < 1.0:
+        for k in ("a", "b", "both"):
+            last[k] = round(last[k] / last["frac"], 1)
 
     # packet type mix over everything either node heard
     types = Counter(p["type"] for p in pa) | Counter(q["type"] for q in only_b)
@@ -308,7 +316,7 @@ th,td{padding:5px 8px;text-align:right;border-bottom:1px solid var(--grid);white
 th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 .bar{display:inline-block;height:10px;vertical-align:middle;border-radius:0 4px 4px 0}.bar.l{border-radius:4px 0 0 4px}
 .select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:6px;padding:6px 10px;max-width:100%}
-tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}
+tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}.hit.pick{cursor:pointer}
 details{margin-top:18px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
 #tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}
 """
@@ -334,12 +342,17 @@ function axes(F,xt,yt,xf,yf,zero){let g='<g class="ax">';for(const t of yt)if(t>
 for(const t of xt)if(t>=F.xlo&&t<=F.xhi)g+=`<text x="${F.x(t)}" y="${F.bottom+16}" text-anchor="middle">${xf(t)}</text>`;
 const by=(zero&&F.ylo<=0&&0<=F.yhi)?F.y(0):F.bottom;return g+`<line class="base" x1="${F.ml}" x2="${F.right}" y1="${by}" y2="${by}"/></g>`}
 function timeTicks(a,b){const span=b-a,step=[900,1800,3600,7200,14400,21600,43200,86400].find(s=>span/s<=7);const t=[];for(let v=Math.ceil(a/step)*step;v<=b;v+=step)t.push(v);return t}
+function bucketIdx(t){return Math.min(EX.nb_buckets-1,Math.max(0,Math.floor((t-EX.t0)/EX.bucket)))}
 function snrChart(rows){
   if(!rows.length)return'<p>no packets</p>';
   const vals=rows.flatMap(r=>[r[2],r[3]]).filter(v=>v!=null);
   let lo=Math.min(...vals),hi=Math.max(...vals);const pad=(hi-lo)*.1||1;lo-=pad;hi+=pad;
   const F=frame(300,44,28,EX.start,EX.end,lo,hi);
   let g=axes(F,timeTicks(EX.start,EX.end),ticks(lo,hi,5),fmtT,v=>(v>0?'+':'')+v,false);
+  // bucketed mean SNR per node, drawn under the dots so the trend reads even when the dots are dense
+  for(const [k,col] of [[2,'var(--a)'],[3,'var(--b)']]){const acc=[];for(const r of rows)if(r[k]!=null){const i=bucketIdx(r[0]);(acc[i]=acc[i]||[]).push(r[k])}
+    let d='',pen=false;for(let i=0;i<EX.nb_buckets;i++){if(!acc[i]||acc[i].length<2){pen=false;continue}d+=(pen?'L':'M')+F.x(EX.t0+(i+.5)*EX.bucket)+','+F.y(mean(acc[i]));pen=true}
+    g+=`<path fill="none" stroke="${col}" stroke-width="2.5" stroke-opacity=".55" stroke-linejoin="round" stroke-linecap="round" d="${d}"/>`}
   for(const r of rows){const x=F.x(r[0]);const both=r[2]!=null&&r[3]!=null;
     const tipS=`${fmtTs(r[0])}\n${NA}: ${r[2]==null?'missed':r[2].toFixed(2)+' dB'+(r[4]!=null?' ('+r[4]+' dBm)':'')}\n${NB}: ${r[3]==null?'missed':r[3].toFixed(2)+' dB'+(r[5]!=null?' ('+r[5]+' dBm)':'')}`+(both?`\nΔ ${f2(r[3]-r[2])} dB`:'');
     if(both)g+=`<line x1="${x}" x2="${x}" y1="${F.y(r[2])}" y2="${F.y(r[3])}" stroke="var(--axis)" stroke-width="1.5"/>`;
@@ -350,14 +363,15 @@ function snrChart(rows){
     g+=`<rect class="hit" x="${x-4}" y="${Math.min(...ys)-6}" width="8" height="${Math.max(...ys)-Math.min(...ys)+12}" data-tip="${esc(tipS)}"/>`}
   return`<svg viewBox="0 0 ${W} ${F.h}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`}
 function countChart(rows){
-  const n=Math.floor((EX.end-EX.t0)/EX.bucket)+1,ca=new Array(n).fill(0),cb=new Array(n).fill(0);
-  for(const r of rows){const i=Math.min(n-1,Math.max(0,Math.floor((r[0]-EX.t0)/EX.bucket)));if(r[2]!=null)ca[i]++;if(r[3]!=null)cb[i]++}
+  const n=EX.nb_buckets,ca=new Array(n).fill(0),cb=new Array(n).fill(0);
+  for(const r of rows){const i=bucketIdx(r[0]);if(r[2]!=null)ca[i]++;if(r[3]!=null)cb[i]++}
+  if(EX.frac<1){ca[n-1]=Math.round(ca[n-1]/EX.frac);cb[n-1]=Math.round(cb[n-1]/EX.frac)}
   const ts=ca.map((_,i)=>EX.t0+i*EX.bucket),mx=Math.max(1,...ca,...cb);
   const F=frame(300,44,28,ts[0],ts[n-1]||ts[0]+1,0,mx*1.1);
   let g=axes(F,timeTicks(ts[0],ts[n-1]),ticks(0,mx,5),fmtT,v=>v,true);
   for(const [c,col] of [[ca,'var(--a)'],[cb,'var(--b)']]){g+=`<path fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" d="${c.map((v,i)=>(i?'L':'M')+F.x(ts[i])+','+F.y(v)).join('')}"/>`}
   const half=n>1?(F.x(ts[1])-F.x(ts[0]))/2:20;
-  ts.forEach((t,i)=>{g+=`<rect class="hit" x="${F.x(t)-half}" y="${F.mt}" width="${2*half}" height="${F.bottom-F.mt}" data-tip="${fmtT(t)}\n${esc(NA)}: ${ca[i]}\n${esc(NB)}: ${cb[i]}"/>`;
+  ts.forEach((t,i)=>{const part=(i==n-1&&EX.frac<1)?`\n(${Math.round(EX.frac*100)}% elapsed, scaled to a full bucket)`:'';g+=`<rect class="hit" x="${F.x(t)-half}" y="${F.mt}" width="${2*half}" height="${F.bottom-F.mt}" data-tip="${fmtT(t)}\n${esc(NA)}: ${ca[i]}\n${esc(NB)}: ${cb[i]}${part}"/>`;
     for(const [c,col] of [[ca,'var(--a)'],[cb,'var(--b)']])g+=`<circle cx="${F.x(t)}" cy="${F.y(c[i])}" r="3" fill="${col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>`});
   return`<svg viewBox="0 0 ${W} ${F.h}" xmlns="http://www.w3.org/2000/svg">${g}</svg>`}
 function render(h){
@@ -370,11 +384,13 @@ function render(h){
     ${stat('Mean SNR, matched',`<span class="ch a">A</span>${f1(sa)}<span class="ch b" style="margin-left:10px">B</span>${f1(sb)}`)}
     ${stat('Δ SNR, B − A',f2(sb-sa)+' dB')}</div>
   <div class="grid2">
-   <div class="card"><h3>Every packet from ${esc(EX.hops[h])}</h3><p>Filled dots joined by a stem: decoded by both. Hollow ring: decoded by one node only. Hover for values.</p>${EX.leg}${snrChart(rows)}</div>
-   <div class="card"><h3>Decoded per ${EX.bucket/60} min</h3><p>How many of this neighbour's packets each node decoded.</p>${EX.leg}${countChart(rows)}</div></div>`}
+   <div class="card"><h3>Every packet from ${esc(EX.hops[h])}</h3><p>Filled dots joined by a stem: decoded by both. Hollow ring: decoded by one node only. Lines are the mean SNR per ${EX.bucket/60} min on each node. Hover for values.</p>${EX.leg}${snrChart(rows)}</div>
+   <div class="card"><h3>Decoded per ${EX.bucket/60} min</h3><p>How many of this neighbour's packets each node decoded.${EX.frac<1?' Last bucket is scaled to a full-bucket rate.':''}</p>${EX.leg}${countChart(rows)}</div></div>`;
+  history.replaceState(null,'','#hop='+encodeURIComponent(EX.hops[h]))}
 sel.addEventListener('change',()=>render(+sel.value));
 document.querySelectorAll('[data-hop]').forEach(el=>el.addEventListener('click',()=>{const i=EX.hops.indexOf(el.dataset.hop);if(i<0)return;sel.value=i;render(i);document.getElementById('explore').scrollIntoView({behavior:'smooth',block:'start'})}));
-render(+sel.value);
+const m=location.hash.match(/^#hop=(.+)$/);const init=m?EX.hops.indexOf(decodeURIComponent(m[1])):-1;
+if(init>=0)sel.value=init;render(+sel.value);
 })();
 """
 
@@ -491,7 +507,7 @@ def chart_excl_neighbours(neigh, na, nb):
             d = (f"M{x0:.1f},{y}h{w-r:.1f}q{r},0 {r},{r}v{rh-8-2*r}q0,{r} -{r},{r}h-{w-r:.1f}Z" if sign > 0 else
                  f"M{x1:.1f},{y}h-{w-r:.1f}q-{r},0 -{r},{r}v{rh-8-2*r}q0,{r} {r},{r}h{w-r:.1f}Z")
             s.add(f'<path class="mark" fill="{col}" d="{d}"/>')
-        s.add(f'<rect class="hit" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: '
+        s.add(f'<rect class="hit pick" data-hop="{esc(n["hop"])}" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: '
               f'only {esc(na)} {n["a"]}, only {esc(nb)} {n["b"]}, both {n["both"]}"/>')
         s.add(f'<text x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
         s.add(f'<text x="{s.ml-8-46}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
@@ -514,7 +530,7 @@ def chart_dumbbell(neigh, na, nb):
     for i, n in enumerate(rows):
         cy = s.mt + i * rh + rh / 2
         xa, xb = s.x(n["snr_a"]), s.x(n["snr_b"])
-        s.add(f'<rect class="hit" x="{s.ml}" y="{cy-rh/2:.1f}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}, {n["both"]} matched\n'
+        s.add(f'<rect class="hit pick" data-hop="{esc(n["hop"])}" x="{s.ml}" y="{cy-rh/2:.1f}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}, {n["both"]} matched\n'
               f'SNR {esc(na)} {n["snr_a"]:+.2f}  {esc(nb)} {n["snr_b"]:+.2f}  Δ {n["dsnr"]:+.2f} dB"/>')
         s.add(f'<line x1="{xa:.1f}" x2="{xb:.1f}" y1="{cy:.1f}" y2="{cy:.1f}" stroke="var(--axis)" stroke-width="2"/>')
         for x, col in ((xa, "var(--a)"), (xb, "var(--b)")):
@@ -636,7 +652,7 @@ def chart_neighbours(neigh, na, nb):
         w = max(1, x1 - x0); r = min(4, w)
         d = (f"M{x0:.1f},{y}h{w-r:.1f}q{r},0 {r},{r}v{rh-8-2*r}q0,{r} -{r},{r}h-{w-r:.1f}Z" if n["dsnr"] > 0 else
              f"M{x1:.1f},{y}h-{w-r:.1f}q-{r},0 -{r},{r}v{rh-8-2*r}q0,{r} {r},{r}h{w-r:.1f}Z")
-        s.add(f'<rect class="hit" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: {n["both"]} matched, '
+        s.add(f'<rect class="hit pick" data-hop="{esc(n["hop"])}" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: {n["both"]} matched, '
               f'{n["a"]} only {esc(na)}, {n["b"]} only {esc(nb)}\\nSNR {esc(na)} {n["snr_a"]:.1f}  {esc(nb)} {n["snr_b"]:.1f}  Δ {n["dsnr"]:+.2f} dB\\n'
               f'RSSI {esc(na)} {n["rssi_a"]:.0f}  {esc(nb)} {n["rssi_b"]:.0f}  Δ {n["drssi"]:+.1f} dB"/>')
         s.add(f'<path class="mark" fill="{col}" d="{d}"/>')
@@ -650,8 +666,9 @@ def tile(label, value, delta="", cls="", hero=False):
             f'<div class="d {cls}">{delta}</div></div>')
 
 
-def render_html(R, nav=""):
-    """Return the full report page. `nav` is optional HTML placed under the title (range links)."""
+def render_html(R, nav="", refresh=0):
+    """Return the full report page. `nav` is optional HTML placed under the title (range links);
+    `refresh` > 0 makes the page reload itself every that many seconds."""
     A, B, pairs = R["A"], R["B"], R["pairs"]
     na, nb = A["name"], B["name"]
     canon = hop_canon({p.get("upstream_hash") for p, _ in pairs} | {p.get("upstream_hash") for p in A["only"]} | {q.get("upstream_hash") for q in B["only"]})
@@ -706,6 +723,7 @@ def render_html(R, nav=""):
     # ---- time series
     bk = R["buckets"]
     ts = [b["t"] for b in bk]
+    partial = f"Last bucket is {100*bk[-1].get('frac', 1):.0f}% elapsed and scaled to a full-bucket rate." if bk and bk[-1].get("frac", 1) < 1 else ""
     cnt_chart = chart_lines([(na, "var(--a)", [b["a"] for b in bk]), (nb, "var(--b)", [b["b"] for b in bk])], ts,
                             yfmt=lambda v: f"{v:g}", zero=True)
     dsnr_chart = chart_lines([("Δ SNR (B−A)", "var(--ink2)", [b["dsnr"] for b in bk])], ts,
@@ -719,7 +737,12 @@ def render_html(R, nav=""):
             acc[i].append(v)
         return [agg(acc[i]) if i in acc else NAN for i in range(len(bk))]
     nz_series = lambda pts: bucketed(pts, mean)
-    crc_chart = chart_lines([(na, "var(--a)", bucketed(A["crc_hist"], sum)), (nb, "var(--b)", bucketed(B["crc_hist"], sum))], ts,
+    def crc_series(pts):
+        v = bucketed(pts, sum)
+        if bk and bk[-1].get("frac", 1) < 1 and v[-1] == v[-1]:
+            v[-1] = round(v[-1] / bk[-1]["frac"], 1)
+        return v
+    crc_chart = chart_lines([(na, "var(--a)", crc_series(A["crc_hist"])), (nb, "var(--b)", crc_series(B["crc_hist"]))], ts,
                             yfmt=lambda v: f"{v:g}", zero=True)
     noise_chart = chart_lines([(na, "var(--a)", nz_series(A["noise"])), (nb, "var(--b)", nz_series(B["noise"]))], ts,
                               yfmt=lambda v: f"{v:.1f}")
@@ -739,6 +762,7 @@ def render_html(R, nav=""):
     pk += [[round(p["timestamp"], 1), hidx[hopname(p)], p["snr"], None, p["rssi"], None] for p in A["only"]]
     pk += [[round(q["timestamp"], 1), hidx[hopname(q)], None, q["snr"], None, q["rssi"]] for q in B["only"]]
     explore = json.dumps({"hops": hops, "pk": pk, "start": R["start"], "end": R["end"], "t0": R["buckets"][0]["t"] if R["buckets"] else R["start"],
+                          "nb_buckets": len(bk), "frac": bk[-1].get("frac", 1) if bk else 1,
                           "bucket": R["bucket"], "na": na, "nb": nb, "leg": leg}, separators=(",", ":")).replace("</", "<\\/")
     hop_opts = "".join(f'<option value="{i}">{esc(n["hop"])} ({n["both"] + n["a"] + n["b"]} packets)</option>' for i, n in enumerate(R["neighbours"]))
 
@@ -771,7 +795,7 @@ def render_html(R, nav=""):
     meta = [hopname(p) for p, _ in pairs]
 
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RX compare · {esc(na)} vs {esc(nb)}</title><style>{CSS}</style></head><body><main>
+<title>RX compare: {esc(na)} vs {esc(nb)}</title>{f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''}<style>{CSS}</style></head><body><main>
 <h1 class="who"><span class="node a"><span class="chip">A</span>{esc(na)}</span><span class="vs">vs</span><span class="node b"><span class="chip">B</span>{esc(nb)}</span></h1>
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
 A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
@@ -795,7 +819,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 
 <h2>By upstream neighbour</h2>
 <div class="grid2">
-<div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
+<div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better. Click a row to explore it.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
 <div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb)}</div>
 </div>
 
@@ -806,10 +830,10 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 
 <h2>Over time</h2>
 <div class="grid2">
-<div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together.</p>{leg}{cnt_chart}</div>
+<div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together. {partial}</p>{leg}{cnt_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
 <div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
-<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise.</p>{leg}{crc_chart}</div>
+<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise. {partial}</p>{leg}{crc_chart}</div>
 </div>
 
 <details><summary>RSSI calibration check: why the report compares SNR, not RSSI</summary>
