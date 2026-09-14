@@ -1,0 +1,7 @@
+.env
+.env.example
+report.html
+*.csv
+__pycache__/
+.git
+README.md

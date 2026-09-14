@@ -1,0 +1,11 @@
+services:
+  rxcompare:
+    build: .
+    image: openhop-rxcompare
+    container_name: openhop-rxcompare
+    env_file: .env
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${LISTEN_PORT:-8090}:8080"
+    restart: unless-stopped
