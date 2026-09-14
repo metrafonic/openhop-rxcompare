@@ -275,7 +275,9 @@ CSS = """
 main{max-width:1200px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 10px;font-weight:600}
 .sub{color:var(--ink2);margin:0 0 20px;overflow-wrap:anywhere}.sub code{font-size:12px}
 .nav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
-.legend{display:flex;gap:18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.sw{display:inline-block;width:.6em;height:.6em;border-radius:50%;margin-right:.3em;vertical-align:baseline}.sw.a{background:var(--a)}.sw.b{background:var(--b)}
+h1 .sw{width:.55em;height:.55em;margin:0 .15em 0 .1em}.legend.intro{margin:4px 0 6px;font-size:14px;color:var(--ink)}.legend.intro b{font-weight:600}
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
@@ -549,10 +551,10 @@ def render_html(R, nav=""):
         tile("Mean SNR advantage (B − A)", f"{md:+.2f} dB" if npair else "–",
              f"{esc(lead)} decodes cleaner on average · 95% CI ±{ci:.2f} · median {med(dsnr):+.2f}" if npair else "", hero=True),
         tile("Decode rate of all transmissions seen", f"{100*rate_a:.1f}% / {100*rate_b:.1f}%" if union else "–",
-             f"{esc(na)} / {esc(nb)} · {union:,} distinct transmissions, {npair:,} heard by both"),
+             f"<span class=\"sw a\"></span>{esc(na)} / <span class=\"sw b\"></span>{esc(nb)} · {union:,} distinct transmissions, {npair:,} heard by both"),
         tile("Which node had the better SNR, per matched packet",
              f"{100*better_a/npair:.0f}% <span style=\"color:var(--ink2);font-weight:400\">·</span> {100*better_b/npair:.0f}%" if npair else "–",
-             f"{split}{esc(na)} · {esc(nb)} · tie {100*ties/npair:.0f}%" if npair else ""),
+             f"{split}<span class=\"sw a\"></span>{esc(na)} · <span class=\"sw b\"></span>{esc(nb)} · tie {100*ties/npair:.0f}%" if npair else ""),
     ]
     def row(k, va, vb, tip=""):
         return f'<tr><td class="k">{k}</td><td>{va}</td><td>{vb}</td><td class="k">{tip}</td></tr>'
@@ -631,7 +633,8 @@ def render_html(R, nav=""):
 
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RX compare · {esc(na)} vs {esc(nb)}</title><style>{CSS}</style></head><body><main>
-<h1>RX comparison: {esc(na)} vs {esc(nb)}</h1>
+<h1>RX comparison: <span class="sw a"></span>{esc(na)} vs <span class="sw b"></span>{esc(nb)}</h1>
+<p class="legend intro"><span><span class="sw a"></span><b>A</b> = {esc(na)}</span><span><span class="sw b"></span><b>B</b> = {esc(nb)}</span><span>all deltas are B − A; positive = {esc(nb)} better</span></p>
 <p class="sub">{esc(win)} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} · packets joined by <code>(packet_hash, path_hash)</code> within {MATCH_WINDOW_S:g} s</p>
 {nav}
 <div class="top">{"".join(tiles)}</div>
