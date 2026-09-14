@@ -306,11 +306,9 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
 .top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
-.split{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:8px 0 6px;background:var(--grid)}.split i{display:block;height:100%}
-.venn{margin:8px 0 4px}.venn .vbar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.venn .vbar i{display:block;height:100%}.venn .oa{background:var(--a)}.venn .ob{background:var(--b)}.venn .bo{background:var(--axis)}
-.venn .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.venn .seg span{text-align:center;overflow:hidden}.venn .seg span.l{text-align:left;overflow:visible}.venn .seg span.r{text-align:right;overflow:visible;direction:rtl}
-.venn .ext{position:relative;height:11px;margin-top:3px}.venn .ext i{position:absolute;top:4px;height:0;border-top:3px solid}.venn .ext i::before,.venn .ext i::after{content:"";position:absolute;top:-5px;width:3px;height:8px;background:currentColor}.venn .ext i::before{left:0}.venn .ext i::after{right:0}
-.venn .ext.a i{border-color:var(--a);color:var(--a)}.venn .ext.b i{border-color:var(--b);color:var(--b)}
+.sbar{margin:8px 0 4px}.sbar .bar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.sbar .bar i{display:block;height:100%}.sbar .a{background:var(--a)}.sbar .b{background:var(--b)}.sbar .n{background:var(--axis)}
+.sbar .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.sbar .seg span{text-align:center;overflow:hidden}.sbar .seg span.l{text-align:left;overflow:visible}.sbar .seg span.r{text-align:right;overflow:visible;direction:rtl}
+
 .nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}
 .nodes td,.nodes th{width:1%}.nodes td:last-child{width:auto;text-align:left;font-size:12px;padding-left:18px}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:28px}
 @media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
@@ -671,6 +669,18 @@ def chart_neighbours(neigh, na, nb):
     return s.render()
 
 
+def segbar(segments, tip=""):
+    """Segmented 100% bar with a label row. segments: [(share 0-1, cls 'a'|'n'|'b', label)];
+    outer labels overflow outward, the middle label is dropped when its segment is too narrow."""
+    bar = "".join(f'<i class="{c}" style="width:{100*w:.2f}%"></i>' for w, c, _ in segments)
+    labs = []
+    for i, (w, c, lbl) in enumerate(segments):
+        al = "l" if i == 0 else "r" if i == len(segments) - 1 else ""
+        show = lbl if (al or w >= 0.11) else ""
+        labs.append(f'<span class="{al}" style="width:{100*w:.2f}%">{show}</span>')
+    return f'<div class="sbar" data-tip="{esc(tip)}"><div class="bar">{bar}</div><div class="seg">{"".join(labs)}</div></div>'
+
+
 def tile(label, value, delta="", cls="", hero=False):
     return (f'<div class="tile{" hero" if hero else ""}"><div class="l">{esc(label)}</div><div class="v{" hero" if hero else ""}">{value}</div>'
             f'<div class="d {cls}">{delta}</div></div>')
@@ -700,22 +710,20 @@ def render_html(R, nav="", refresh=0):
     ci = 1.96 * st.pstdev(dsnr) / math.sqrt(npair) if npair > 1 else NAN
     lead = nb if md > 0 else na
     ties = npair - better_a - better_b
-    split = (f'<div class="split"><i style="width:{100*better_a/npair:.1f}%;background:var(--a)"></i>'
-             f'<i style="width:{100*ties/npair:.1f}%"></i><i style="width:{100*better_b/npair:.1f}%;background:var(--b)"></i></div>') if npair else ""
+    oa, ob = len(A["only"]), len(B["only"])
+    rate_bar = segbar([(oa / union, "a", f"A only {100*oa/union:.0f}%"), (npair / union, "n", f"both {100*npair/union:.0f}%"), (ob / union, "b", f"B only {100*ob/union:.0f}%")],
+                      tip=f"only {na}: {oa:,} ({100*oa/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {nb}: {ob:,} ({100*ob/union:.1f}%)") if union else ""
+    snr_bar = segbar([(better_a / npair, "a", f"A {100*better_a/npair:.0f}%"), (ties / npair, "n", f"tie {100*ties/npair:.0f}%"), (better_b / npair, "b", f"B {100*better_b/npair:.0f}%")],
+                     tip=f"{na} better: {better_a:,}\ntie: {ties:,}\n{nb} better: {better_b:,}") if npair else ""
     tiles = [
         tile("Mean SNR advantage, B − A", f"{md:+.2f} dB" if npair else "–",
              f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
         tile("Decode rate of all transmissions seen",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             (f'<div class="venn" data-tip="only {esc(na)}: {len(A["only"]):,} ({100*len(A["only"])/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {esc(nb)}: {len(B["only"]):,} ({100*len(B["only"])/union:.1f}%)">'
-              f'<div class="vbar"><i class="oa" style="width:{100*len(A["only"])/union:.2f}%"></i><i class="bo" style="width:{100*npair/union:.2f}%"></i><i class="ob" style="width:{100*len(B["only"])/union:.2f}%"></i></div>'
-              f'<div class="seg"><span class="l" style="width:{100*len(A["only"])/union:.2f}%">A only {100*len(A["only"])/union:.0f}%</span><span style="width:{100*npair/union:.2f}%">{f"both {100*npair/union:.0f}%" if npair/union >= .11 else ""}</span><span class="r" style="width:{100*len(B["only"])/union:.2f}%">B only {100*len(B["only"])/union:.0f}%</span></div>'
-              f'<div class="ext a"><i style="left:0;width:{100*rate_a:.2f}%"></i></div>'
-              f'<div class="ext b"><i style="left:{100*len(A["only"])/union:.2f}%;width:{100*rate_b:.2f}%"></i></div></div>'
-              f"{union:,} distinct transmissions, {npair:,} of them heard by both. Brackets show each node's share.") if union else ""),
+             f"{rate_bar}{union:,} distinct transmissions, {npair:,} of them heard by both."),
         tile("Better SNR on the same packet",
              f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
-             f"{split}Tie on {100*ties/npair:.0f}% of matched packets." if npair else ""),
+             f"{snr_bar}{npair:,} matched packets; a tie is an identical SNR reading." if npair else ""),
     ]
     def row(k, va, vb, tip=""):
         return f'<tr><td class="k">{k}</td><td>{va}</td><td>{vb}</td><td class="k">{tip}</td></tr>'
