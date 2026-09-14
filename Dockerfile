@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-LABEL org.opencontainers.image.source=https://github.com/metrafonic/openhop_compare
+LABEL org.opencontainers.image.source=https://github.com/metrafonic/openhop-rxcompare
 WORKDIR /app
 COPY rxcompare.py server.py ./
 ENV PYTHONUNBUFFERED=1 PORT=8080

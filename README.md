@@ -1,6 +1,6 @@
 # openhop-rxcompare
 
-[![docker](https://github.com/metrafonic/openhop_compare/actions/workflows/docker.yml/badge.svg)](https://github.com/metrafonic/openhop_compare/actions/workflows/docker.yml)
+[![docker](https://github.com/metrafonic/openhop-rxcompare/actions/workflows/docker.yml/badge.svg)](https://github.com/metrafonic/openhop-rxcompare/actions/workflows/docker.yml)
 
 Compare the receive performance of two openHop LoRa repeaters
 listening on the same channel — e.g. two different boards or antennas installed side by
@@ -20,7 +20,7 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 ## Run with Docker
 
 A multi-arch image (amd64, arm64) is published to
-`ghcr.io/metrafonic/openhop_compare` on every push to `main`.
+`ghcr.io/metrafonic/openhop-rxcompare` on every push to `main`.
 
 ```sh
 cp .env.example .env      # fill in the two node URLs and API keys
@@ -31,7 +31,7 @@ open http://localhost:8090
 To build the image yourself instead of pulling it:
 
 ```sh
-docker build -t ghcr.io/metrafonic/openhop_compare:latest .
+docker build -t ghcr.io/metrafonic/openhop-rxcompare:latest .
 docker compose up -d
 ```
 
