@@ -307,7 +307,7 @@ table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:ta
 th,td{padding:5px 8px;text-align:right;border-bottom:1px solid var(--grid);white-space:nowrap}th{color:var(--ink2);font-weight:500}
 th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 .bar{display:inline-block;height:10px;vertical-align:middle;border-radius:0 4px 4px 0}.bar.l{border-radius:4px 0 0 4px}
-details{margin-top:12px}summary{cursor:pointer;color:var(--ink2)}
+details{margin-top:18px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
 #tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}
 """
 
@@ -375,8 +375,9 @@ class Svg:
         return f'<svg viewBox="0 0 {self.w} {self.h}" xmlns="http://www.w3.org/2000/svg">{"".join(self.parts)}</svg>'
 
 
-def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--a)", clamp=True):
-    """Single-series histogram. `values` binned into [lo,hi] by `step`; ends clamped."""
+def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--a)", clamp=True, h=240, marker=None):
+    """Single-series histogram. `values` binned into [lo,hi] by `step`; ends clamped.
+    `marker=(value, label)` draws a vertical reference line."""
     if not values:
         return "<p>no data</p>"
     bins = defaultdict(int)
@@ -386,7 +387,7 @@ def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--a)", clamp=T
             b = max(lo, min(hi, b))
         bins[round(b, 6)] += 1
     xs = sorted(bins)
-    s = Svg()
+    s = Svg(h=h)
     s.scales(lo - step / 2, hi + step * 1.5, 0, max(bins.values()) * 1.08)
     s.axes([x for x in xs if int(round(x / step)) % (2 if step < 1 else 1) == 0], nice_ticks(0, max(bins.values())),
            xfmt=lambda t: f"{t:+g}" if t else "0")
@@ -400,6 +401,65 @@ def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--a)", clamp=T
         s.add(f'<rect class="hit" x="{cx-bw/2-1:.1f}" y="{s.mt}" width="{bw+2:.1f}" height="{s.h-s.mt-s.mb}" '
               f'data-tip="{lbl} {unit}: {n} packets ({100*n/total:.0f}%)"/>')
         s.add(f'<path class="mark" fill="{color}" d="M{cx-bw/2:.1f},{base:.1f}V{top+r:.1f}q0,-{r} {r},-{r}h{bw-2*r:.1f}q{r},0 {r},{r}V{base:.1f}Z"/>')
+    if marker:
+        mv, ml = marker
+        mx = s.x(mv + step / 2)
+        s.add(f'<line x1="{mx:.1f}" x2="{mx:.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--ink)" stroke-width="1.5"/>'
+              f'<text class="lbl" x="{mx+6:.1f}" y="{s.mt+12}" fill="var(--ink)">{esc(ml)}</text>')
+    return s.render()
+
+
+def chart_excl_neighbours(neigh, na, nb):
+    """Diverging counts per upstream hop: packets only A decoded (left) vs only B (right)."""
+    rows = sorted([n for n in neigh if n["a"] + n["b"] >= 3], key=lambda n: -(n["a"] + n["b"]))[:16]
+    if not rows:
+        return "<p>no exclusive packets yet</p>"
+    mx = max(max(n["a"], n["b"]) for n in rows) or 1
+    rh = 20
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
+    s.scales(-mx * 1.15, mx * 1.15, 0, len(rows))
+    s.axes(nice_ticks(-mx, mx, 6), [], xfmt=lambda t: f"{abs(t):g}", y0=False)
+    s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
+    for i, n in enumerate(rows):
+        y = s.mt + i * rh + 4
+        for v, col, sign in ((n["a"], "var(--a)", -1), (n["b"], "var(--b)", 1)):
+            if not v:
+                continue
+            x0, x1 = sorted((s.x(0), s.x(sign * v)))
+            w = max(1, x1 - x0); r = min(4, w)
+            d = (f"M{x0:.1f},{y}h{w-r:.1f}q{r},0 {r},{r}v{rh-8-2*r}q0,{r} -{r},{r}h-{w-r:.1f}Z" if sign > 0 else
+                 f"M{x1:.1f},{y}h-{w-r:.1f}q-{r},0 -{r},{r}v{rh-8-2*r}q0,{r} {r},{r}h{w-r:.1f}Z")
+            s.add(f'<path class="mark" fill="{col}" d="{d}"/>')
+        s.add(f'<rect class="hit" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: '
+              f'only {esc(na)} {n["a"]}, only {esc(nb)} {n["b"]}, both {n["both"]}"/>')
+        s.add(f'<text x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
+        s.add(f'<text x="{s.ml-8-46}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
+    return s.render()
+
+
+def chart_dumbbell(neigh, na, nb):
+    """Per neighbour: mean SNR on A and on B as two dots joined by a line, strongest at the top."""
+    rows = sorted([n for n in neigh if n["both"] >= 3], key=lambda n: -(n["snr_a"] + n["snr_b"]))[:20]
+    if not rows:
+        return "<p>not enough matched packets per neighbour yet</p>"
+    vals = [v for n in rows for v in (n["snr_a"], n["snr_b"])]
+    lo, hi = min(vals) - 1.5, max(vals) + 1.5
+    rh = 20
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
+    s.scales(lo, hi, 0, len(rows))
+    s.axes(nice_ticks(lo, hi, 6), [], xfmt=lambda t: f"{t:+g}" if t else "0", y0=False)
+    if lo < 0 < hi:
+        s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
+    for i, n in enumerate(rows):
+        cy = s.mt + i * rh + rh / 2
+        xa, xb = s.x(n["snr_a"]), s.x(n["snr_b"])
+        s.add(f'<rect class="hit" x="{s.ml}" y="{cy-rh/2:.1f}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}, {n["both"]} matched\n'
+              f'SNR {esc(na)} {n["snr_a"]:+.2f}  {esc(nb)} {n["snr_b"]:+.2f}  Δ {n["dsnr"]:+.2f} dB"/>')
+        s.add(f'<line x1="{xa:.1f}" x2="{xb:.1f}" y1="{cy:.1f}" y2="{cy:.1f}" stroke="var(--axis)" stroke-width="2"/>')
+        for x, col in ((xa, "var(--a)"), (xb, "var(--b)")):
+            s.add(f'<circle class="mark" cx="{x:.1f}" cy="{cy:.1f}" r="5" fill="{col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
+        s.add(f'<text x="{s.ml-8}" y="{cy+4:.1f}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
+        s.add(f'<text x="{s.ml-8-46}" y="{cy+4:.1f}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
     return s.render()
 
 
@@ -609,7 +669,7 @@ def render_html(R, nav=""):
     excl_note = ""
     for n_, lst in ((na, ex_a), (nb, ex_b)):
         if lst:
-            excl_note += (f'<p style="margin-top:10px"><b>Heard only by {esc(n_)}</b> (never decoded by the other node): '
+            excl_note += (f'<p style="margin-top:10px"><b>Never decoded by the other node:</b> only {esc(n_)} hears '
                           + ", ".join(f"{esc(x['hop'])} ({x['a'] + x['b']})" for x in lst) + "</p>")
     # ---- neighbour table
     nrows = []
@@ -650,33 +710,43 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <h2>Per node</h2>
 {node_table}
 
-<h2>Matched packets: the same transmission heard by both</h2>
+<h2>The same transmission, heard by both</h2>
 <div class="grid2">
-<div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal = {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
-<div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves — compare SNR instead.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
-<div class="card"><h3>Δ SNR distribution (B − A)</h3><p>Positive = {esc(nb)} better. {npair} packets.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)')}</div>
-<div class="card"><h3>Δ RSSI distribution (B − A)</h3><p>Positive = {esc(nb)} stronger. A bimodal shape here is a calibration artefact, not antenna gain.</p>{chart_hist(drssi, -10, 10, 1, '', color='var(--ink2)')}</div>
+<div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
+<div class="card"><h3>Δ SNR per packet, B − A</h3><p>{npair:,} matched packets. Positive means {esc(nb)} decoded it cleaner.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)', h=360, marker=(md, f'mean {md:+.2f}'))}</div>
 </div>
 
-<h2>Packets only one node heard</h2>
-<div class="grid">
-<div class="card"><h3>SNR of exclusive packets</h3><p>Where the other node missed the packet. Weak-signal misses (left) are sensitivity; strong-signal misses (right) are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
-<div class="card"><h3>Δ SNR per upstream neighbour (B − A)</h3><p>Averaged over matched packets, last hop with ≥3 matches. Bar colour = the node that hears that neighbour better.</p>{chart_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
+<h2>Packets only one node decoded</h2>
+<div class="grid2">
+<div class="card"><h3>How weak were they</h3><p>SNR of packets the other node missed. Misses on the left are the other node running out of sensitivity; misses on the right are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
+<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
+</div>
+
+<h2>By upstream neighbour</h2>
+<div class="grid2">
+<div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
+<div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb)}</div>
 </div>
 
 <h2>Over time</h2>
 <div class="grid2">
-<div class="card"><h3>Packets received per {R['bucket']//60} min</h3><p>Includes both matched and exclusive packets.</p>{leg}{cnt_chart}</div>
-<div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min (B − A)</h3><p>Should be flat; a drift points at a hardware/temperature/interference change on one side.</p>{dsnr_chart}</div>
-<div class="card"><h3>Noise floor (dBm)</h3><p>From each node's own measurements. Offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
-<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors with the same decode count usually means the radio is hearing further out into the noise.</p>{leg}{crc_chart}</div>
+<div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together.</p>{leg}{cnt_chart}</div>
+<div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
+<div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
+<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise.</p>{leg}{crc_chart}</div>
 </div>
 
-<h2>Per upstream neighbour</h2>
-<p class="meta" style="margin:-4px 0 10px">Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
+<details><summary>RSSI calibration check: why the report compares SNR, not RSSI</summary>
+<div class="grid2" style="margin-top:10px">
+<div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
+<div class="card"><h3>Δ RSSI per packet, B − A</h3><p>A bimodal shape here is a calibration artefact, not antenna gain. Mean {mean(drssi):+.2f} dB.</p>{chart_hist(drssi, -10, 10, 1, '', color='var(--ink2)', h=360)}</div>
+</div></details>
+
+<details open><summary>Per-neighbour table ({len(R['neighbours'])} rows)</summary>
+<p class="meta">Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
 <div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ RSSI</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ SNR (B−A)</th></tr></thead>
-<tbody>{"".join(nrows)}</tbody></table></div>
+<tbody>{"".join(nrows)}</tbody></table></div></details>
 
 <details><summary>Per-bucket table ({len(bk)} rows)</summary><div class="card wrap"><table><thead><tr><th>bucket</th><th>{esc(na)}</th><th>{esc(nb)}</th><th>both</th><th>Δ RSSI</th><th>Δ SNR</th></tr></thead><tbody>{brows}</tbody></table></div></details>
 <details><summary>All matched packets ({npair} rows)</summary><div class="card wrap"><table><thead><tr><th>time</th><th>hop</th><th>type</th><th>len</th>

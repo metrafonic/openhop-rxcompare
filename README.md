@@ -12,8 +12,9 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 - **decode rate**: of every transmission at least one node heard, the share each node decoded
 - **SNR advantage** per packet (with a confidence interval), per upstream neighbour and over
   time (the fair metric — RSSI is calibrated differently per radio and is shown but flagged as such)
-- packets **only one node** decoded, and how weak they were (sensitivity vs. collisions), plus
-  neighbours that only one node ever hears
+- packets **only one node** decoded: how weak they were (sensitivity vs. collisions) and
+  which neighbours each node misses
+- **per neighbour**: SNR on each node side by side, so threshold-level neighbours stand out
 - noise floor and CRC errors per node, over the same window
 - a self-contained HTML report with hover tooltips, light/dark, phone layout and table views
 
