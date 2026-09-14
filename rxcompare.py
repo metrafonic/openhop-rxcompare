@@ -272,12 +272,19 @@ CSS = """
 :root[data-theme=dark]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;
 --grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--a:#3987e5;--b:#d95926;--good:#0ca30c;--bad:#e66767}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px 48px}
-main{max-width:1200px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 10px;font-weight:600}
+main{max-width:1200px;margin:0 auto}h2{font-size:15px;margin:28px 0 10px;font-weight:600}
+h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0 14px;font-size:30px;font-weight:600;letter-spacing:-.01em}
+.who .node{display:inline-flex;align-items:baseline;gap:10px;padding-bottom:6px;border-bottom:4px solid}.who .node.a{border-color:var(--a)}.who .node.b{border-color:var(--b)}
+.who .chip{font-size:15px;font-weight:700;line-height:1;color:#fff;padding:5px 7px 4px;border-radius:5px;align-self:center}.who .node.a .chip{background:var(--a)}.who .node.b .chip{background:var(--b)}
+.who .vs{font-size:16px;font-weight:400;color:var(--muted)}
+.ch{display:inline-block;font-size:11px;font-weight:700;line-height:1;color:#fff;padding:3px 5px 2px;border-radius:4px;vertical-align:.15em;margin-right:5px}.ch.a{background:var(--a)}.ch.b{background:var(--b)}
+.tile .v .ch{font-size:13px;padding:4px 6px 3px;vertical-align:.25em;margin:0 6px 0 0}.tile .v .ch.b{margin-left:14px}
+.meta{color:var(--ink2);max-width:72ch;margin:0 0 14px;line-height:1.5}
 .sub{color:var(--ink2);margin:0 0 20px;overflow-wrap:anywhere}.sub code{font-size:12px}
 .nav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .sw{display:inline-block;width:.6em;height:.6em;border-radius:50%;margin-right:.3em;vertical-align:baseline}.sw.a{background:var(--a)}.sw.b{background:var(--b)}
-h1 .sw{width:.55em;height:.55em;margin:0 .15em 0 .1em}.legend.intro{margin:4px 0 6px;font-size:14px;color:var(--ink)}.legend.intro b{font-weight:600}
+
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
@@ -534,7 +541,7 @@ def render_html(R, nav=""):
     better_b = sum(1 for d in dsnr if d > 0); better_a = sum(1 for d in dsnr if d < 0)
     span_h = (R["end"] - R["start"]) / 3600
     win = f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(R['start']))} → {time.strftime('%H:%M', time.localtime(R['end']))} ({span_h:.1f} h)"
-    leg = f'<div class="legend"><span><i style="background:var(--a)"></i>{esc(na)} (A)</span><span><i style="background:var(--b)"></i>{esc(nb)} (B)</span></div>'
+    leg = f'<div class="legend"><span><span class="ch a">A</span>{esc(na)}</span><span><span class="ch b">B</span>{esc(nb)}</span></div>'
 
     # ---- headline row + per-node table
     weak_a = sum(1 for v in A['snr'] + [p['snr'] for p in A['only']] if v < -5)
@@ -548,13 +555,14 @@ def render_html(R, nav=""):
     split = (f'<div class="split"><i style="width:{100*better_a/npair:.1f}%;background:var(--a)"></i>'
              f'<i style="width:{100*ties/npair:.1f}%"></i><i style="width:{100*better_b/npair:.1f}%;background:var(--b)"></i></div>') if npair else ""
     tiles = [
-        tile("Mean SNR advantage (B − A)", f"{md:+.2f} dB" if npair else "–",
-             f"{esc(lead)} decodes cleaner on average · 95% CI ±{ci:.2f} · median {med(dsnr):+.2f}" if npair else "", hero=True),
-        tile("Decode rate of all transmissions seen", f"{100*rate_a:.1f}% / {100*rate_b:.1f}%" if union else "–",
-             f"<span class=\"sw a\"></span>{esc(na)} / <span class=\"sw b\"></span>{esc(nb)} · {union:,} distinct transmissions, {npair:,} heard by both"),
-        tile("Which node had the better SNR, per matched packet",
-             f"{100*better_a/npair:.0f}% <span style=\"color:var(--ink2);font-weight:400\">·</span> {100*better_b/npair:.0f}%" if npair else "–",
-             f"{split}<span class=\"sw a\"></span>{esc(na)} · <span class=\"sw b\"></span>{esc(nb)} · tie {100*ties/npair:.0f}%" if npair else ""),
+        tile("Mean SNR advantage, B − A", f"{md:+.2f} dB" if npair else "–",
+             f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
+        tile("Decode rate of all transmissions seen",
+             f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
+             f"{union:,} distinct transmissions, {npair:,} of them heard by both."),
+        tile("Better SNR on the same packet",
+             f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
+             f"{split}Tie on {100*ties/npair:.0f}% of matched packets." if npair else ""),
     ]
     def row(k, va, vb, tip=""):
         return f'<tr><td class="k">{k}</td><td>{va}</td><td>{vb}</td><td class="k">{tip}</td></tr>'
@@ -562,17 +570,17 @@ def render_html(R, nav=""):
         return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
     node_rows = "".join([
         row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}"),
-        row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "the other node missed these"),
-        row("… avg SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low = the other node's sensitivity limit; high = collisions/timing"),
+        row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "packets the other node missed"),
+        row("Average SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low means the other node ran out of sensitivity; high means collisions or timing"),
         row("Weak packets decoded (SNR < −5 dB)", f"{weak_a:,}", f"{weak_b:,}", "sensitivity at the margin"),
         row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB"),
-        row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio — see scatter"),
+        row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio, see the RSSI scatter"),
         row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm", "node's own measurement"),
-        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}", "in this window — detected preambles that failed to decode"),
+        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}", "preambles detected in this window that failed to decode"),
     ])
     node_table = (f'<div class="card wrap"><table class="nodes"><thead><tr><th></th>'
-                  f'<th><span class="sw" style="background:var(--a)"></span>{esc(na)}</th>'
-                  f'<th><span class="sw" style="background:var(--b)"></span>{esc(nb)}</th><th></th></tr></thead><tbody>{node_rows}</tbody></table></div>')
+                  f'<th><span class="ch a">A</span>{esc(na)}</th>'
+                  f'<th><span class="ch b">B</span>{esc(nb)}</th><th></th></tr></thead><tbody>{node_rows}</tbody></table></div>')
 
     # ---- time series
     bk = R["buckets"]
@@ -633,15 +641,16 @@ def render_html(R, nav=""):
 
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RX compare · {esc(na)} vs {esc(nb)}</title><style>{CSS}</style></head><body><main>
-<h1>RX comparison: <span class="sw a"></span>{esc(na)} vs <span class="sw b"></span>{esc(nb)}</h1>
-<p class="legend intro"><span><span class="sw a"></span><b>A</b> = {esc(na)}</span><span><span class="sw b"></span><b>B</b> = {esc(nb)}</span><span>all deltas are B − A; positive = {esc(nb)} better</span></p>
-<p class="sub">{esc(win)} · generated {time.strftime('%Y-%m-%d %H:%M:%S')} · packets joined by <code>(packet_hash, path_hash)</code> within {MATCH_WINDOW_S:g} s</p>
+<h1 class="who"><span class="node a"><span class="chip">A</span>{esc(na)}</span><span class="vs">vs</span><span class="node b"><span class="chip">B</span>{esc(nb)}</span></h1>
+<p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
+A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
+Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 {nav}
 <div class="top">{"".join(tiles)}</div>
 <h2>Per node</h2>
 {node_table}
 
-<h2>Matched packets — same transmission heard by both</h2>
+<h2>Matched packets: the same transmission heard by both</h2>
 <div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal = {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
 <div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves — compare SNR instead.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
@@ -664,7 +673,7 @@ def render_html(R, nav=""):
 </div>
 
 <h2>Per upstream neighbour</h2>
-<p class="sub" style="margin:-4px 0 10px">Path hashes of different lengths that refer to the same node (e.g. <code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
+<p class="meta" style="margin:-4px 0 10px">Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
 <div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ RSSI</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ SNR (B−A)</th></tr></thead>
 <tbody>{"".join(nrows)}</tbody></table></div>
