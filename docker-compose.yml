@@ -7,4 +7,9 @@ services:
       TZ: ${TZ:-UTC}
     ports:
       - "${LISTEN_PORT:-8090}:8080"
+    volumes:
+      - rxcompare-data:/data   # advert cache (ADVERT_CACHE), so neighbour positions survive restarts
     restart: unless-stopped
+
+volumes:
+  rxcompare-data:

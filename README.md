@@ -27,6 +27,11 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 - **decode rate over time** and a match-quality check (clock offset between the nodes,
   pairs that disagree wildly)
 - **per neighbour**: SNR on each node side by side, so threshold-level neighbours stand out
+- **where the neighbours are**: every neighbour whose advert carried a position, placed around the
+  two radios — a bearing-and-distance radar (inline SVG, log distance), a terrain map (Leaflet,
+  loaded on request), SNR against distance with a fit per node, and a reading that says whether the
+  difference has a *direction* (the masts) or not (the receivers). Radios more than 1 km apart get
+  their own lines and the reading switches to "the split is geography"
 - noise floor and CRC errors per node, over the same window
 - an interactive **neighbour explorer**: pick a hop and see every one of its packets over the
   window on both nodes, plus its decode counts per bucket
@@ -92,6 +97,12 @@ All settings are environment variables — see [`.env.example`](.env.example).
 | `LISTEN_PORT` | host port for compose (default 8090) |
 | `VERIFY_TLS` | set `false` for self-signed certs |
 | `TZ` | timezone for time axes |
+| `A_LAT`, `A_LON`, `B_LAT`, `B_LON` | override a radio's position (default: openHop's `/api/gps`, manual config or fix) |
+| `ADVERT_LOOKBACK_H` | how far back to read adverts for neighbour positions (default 336 — nodes advertise once a day or less) |
+| `ADVERT_CACHE` | JSON file where adverts accumulate across runs, so a position once seen sticks (the Docker image sets `/data/adverts.json` on a volume) |
+| `MAP_TILES`, `MAP_ATTRIB` | Leaflet tile template and attribution (default OpenTopoMap) |
+| `MAP_AUTO` | `1` loads the map without the click; otherwise the click is remembered per browser |
+| `MAP_GRAY` | tiles are desaturated so only the data carries colour; `0` keeps the tiles' own colours |
 
 API keys are created in the openHop web UI under *Sessions → API tokens*.
 
@@ -102,6 +113,12 @@ Both nodes log every packet they decode with RSSI and SNR. A transmission is ide
 different transmissions — and matched across nodes when the timestamps are within 3 s.
 The comparison window is clamped to the period where both nodes have data, so a restart on
 one side doesn't count as missed packets.
+
+Neighbour positions come from the neighbours' own adverts: a MeshCore advert carries the node's
+public key, name and (when set) lat/lon, and a hop hash in a path is the first 1–3 bytes of that
+key. A hop is placed when the positioned adverts whose key starts with it agree; a 1-byte hash that
+several keys start with is left off as ambiguous. Adverts are read from both nodes' packet history
+over the last `ADVERT_LOOKBACK_H` and merged into `ADVERT_CACHE`.
 
 Compare **SNR**, not RSSI: different LoRa front ends report RSSI on different calibration
 curves (the RSSI scatter in the report typically shows a bend rather than a straight

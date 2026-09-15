@@ -14,7 +14,7 @@ Usage:
 Keys/URLs come from env: A_URL A_KEY A_NAME B_URL B_KEY B_NAME
 (or the --a-url/--a-key/... flags).
 """
-import argparse, csv, html, json, math, os, ssl, statistics as st, sys, time, urllib.request, urllib.parse
+import argparse, csv, html, json, math, os, ssl, statistics as st, struct, sys, time, urllib.request, urllib.parse
 from collections import Counter, defaultdict
 
 MATCH_WINDOW_S = 3.0   # both nodes hear the same transmission within this many seconds
@@ -23,6 +23,11 @@ TYPE_NAMES = {0: "REQ", 1: "RESPONSE", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "
               7: "ANON_REQ", 8: "PATH", 9: "TRACE", 10: "MULTIPART", 11: "CONTROL"}
 PAGE = 1000
 NAN = float("nan")
+ADVERT_LOOKBACK_H = float(os.environ.get("ADVERT_LOOKBACK_H", "336"))   # nodes advertise once a day or less: look this far back for positions
+ADVERT_CACHE = os.environ.get("ADVERT_CACHE", "")   # optional JSON file; adverts accumulate here across runs so a position, once seen, sticks
+_adverts = {}   # pubkey -> advert, accumulated over the process lifetime (and the cache file)
+MAP_TILES = os.environ.get("MAP_TILES", "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png")
+MAP_ATTRIB = os.environ.get("MAP_ATTRIB", '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)')
 
 def _ssl_ctx():
     ctx = ssl.create_default_context()
@@ -38,8 +43,9 @@ CTX = _ssl_ctx()
 # --------------------------------------------------------------------------- API
 
 class Node:
-    def __init__(self, name, url, key):
+    def __init__(self, name, url, key, lat=None, lon=None):
         self.name, self.url, self.key = name, url.rstrip("/"), key
+        self.pos = (float(lat), float(lon)) if lat and lon else None   # configured override for position()
 
     def get(self, path, **params):
         q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -73,6 +79,70 @@ class Node:
         except Exception:
             return []
         return [(x["timestamp"], x["count"]) for x in h if x.get("count") is not None]
+
+    def position(self):
+        """(lat, lon) of this repeater: the configured override, else openHop's effective position
+        (manual config until a GPS fix). None when neither is set."""
+        if self.pos:
+            return self.pos
+        try:
+            p = self.get("gps")["data"]["position"]
+            lat, lon = p.get("latitude"), p.get("longitude")
+            return (lat, lon) if lat and lon else None
+        except Exception:
+            return None
+
+    def adverts(self, hours):
+        """pubkey -> latest decoded advert seen in the packet history (any hop away). Nodes advertise once a
+        day or less, so this pages back through the whole lookback rather than stopping at one 5000-row
+        answer. Older openHop builds without the endpoint yield nothing and the map simply stays empty."""
+        end = time.time()
+        start = end - hours * 3600
+        rows, until = [], end
+        for _ in range(20):
+            try:
+                d = self.get("filtered_packets", type=4, start_timestamp=int(start), end_timestamp=int(until), limit=5000)
+            except Exception:
+                break
+            batch = d.get("data", []) if isinstance(d, dict) else d
+            rows.extend(batch)
+            if len(batch) < 5000:
+                break
+            until = min(p.get("timestamp", until) for p in batch) - 0.001   # the answer is the newest 5000; continue below them
+        out = {}
+        for p in sorted(rows, key=lambda p: p.get("timestamp", 0)):
+            d = decode_advert(p.get("payload"))
+            if not d:
+                continue
+            d["ts"] = p.get("timestamp")
+            prev = out.get(d["pubkey"])
+            if prev and d["lat"] is None:   # newest advert wins, but a position is never lost to a later advert without one
+                d["lat"], d["lon"] = prev["lat"], prev["lon"]
+            out[d["pubkey"]] = d
+        return out
+
+
+def decode_advert(payload_hex):
+    """MeshCore ADVERT payload: pubkey[32] timestamp[4] signature[64] flags[1], then by flag bit:
+    0x10 lat/lon as int32 microdegrees, 0x20 battery u16, 0x40 temperature u16, 0x80 name to the end."""
+    try:
+        b = bytes.fromhex(payload_hex or "")
+    except ValueError:
+        return None
+    if len(b) < 101:
+        return None
+    flags, i = b[100], 101
+    d = {"pubkey": b[:32].hex(), "type": flags & 0x0F, "lat": None, "lon": None, "name": ""}
+    if flags & 0x10 and len(b) >= i + 8:
+        lat, lon = struct.unpack_from("<ii", b, i)
+        i += 8
+        if lat or lon:   # 0,0 is "not set"
+            d["lat"], d["lon"] = lat / 1e6, lon / 1e6
+    i += 2 if flags & 0x20 else 0
+    i += 2 if flags & 0x40 else 0
+    if flags & 0x80:
+        d["name"] = b[i:].decode("utf-8", "replace").strip("\x00 ")
+    return d
 
 
 # --------------------------------------------------------------------------- analysis
@@ -113,6 +183,72 @@ def hop_canon(hashes):
         roots = {out.get(x, x) for x in longer}
         out[h] = roots.pop() if len(roots) == 1 else h
     return out
+
+
+def advert_store(*fresh):
+    """Merge freshly decoded adverts into the accumulated set (memory, plus ADVERT_CACHE on disk when set):
+    the newest advert per pubkey, never dropping a known position for a later advert without one."""
+    if ADVERT_CACHE and not _adverts:
+        try:
+            with open(ADVERT_CACHE) as f:
+                _adverts.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+    for batch in fresh:
+        for pk, d in batch.items():
+            prev = _adverts.get(pk)
+            if prev and (prev.get("ts") or 0) > (d.get("ts") or 0):
+                prev, d = d, prev
+            if prev and d["lat"] is None and prev["lat"] is not None:
+                d = {**d, "lat": prev["lat"], "lon": prev["lon"]}
+            _adverts[pk] = d
+    if ADVERT_CACHE and fresh and any(fresh):
+        try:
+            tmp = ADVERT_CACHE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(_adverts, f, separators=(",", ":"))
+            os.replace(tmp, ADVERT_CACHE)
+        except OSError as e:
+            print(f"advert cache: {e}", file=sys.stderr)
+    return _adverts
+
+
+def haversine_km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+
+def bearing_deg(a, b):
+    la1, la2, dlo = math.radians(a[0]), math.radians(b[0]), math.radians(b[1] - a[1])
+    x = math.sin(dlo) * math.cos(la2)
+    y = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlo)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def geo_build(pos_a, pos_b, neighbours, adverts):
+    """Place the neighbours around the two radios. A hop hash is the first 1-3 bytes of the node's public
+    key, so a hop is placed when the adverts with a position whose pubkey starts with it all agree."""
+    hops = [n["hop"] for n in neighbours if n["hop"] != "direct"]
+    if not pos_a and not pos_b:
+        return {"a": None, "b": None, "mid": None, "apart": NAN, "nb": [], "unplaced": hops, "ambiguous": [], "adverts": len(adverts)}
+    pos_a, pos_b = pos_a or pos_b, pos_b or pos_a   # one radio without a position sits at the other's
+    mid = ((pos_a[0] + pos_b[0]) / 2, (pos_a[1] + pos_b[1]) / 2)
+    placed, unplaced, ambiguous = [], [], []
+    for hop in hops:
+        cands = [d for pk, d in adverts.items() if pk.startswith(hop.lower()) and d["lat"] is not None]
+        if not cands:
+            unplaced.append(hop)
+            continue
+        if len({(round(d["lat"], 3), round(d["lon"], 3)) for d in cands}) > 1:
+            ambiguous.append(hop)
+            continue
+        d = cands[-1]
+        ll = (d["lat"], d["lon"])
+        placed.append({"hop": hop, "name": d["name"], "ll": ll, "d": haversine_km(mid, ll), "brg": bearing_deg(mid, ll),
+                       "da": haversine_km(pos_a, ll), "db": haversine_km(pos_b, ll)})
+    return {"a": pos_a, "b": pos_b, "mid": mid, "apart": haversine_km(pos_a, pos_b), "nb": placed,
+            "unplaced": unplaced, "ambiguous": ambiguous, "adverts": len(adverts)}
 
 
 def mean(xs):
@@ -258,6 +394,11 @@ def analyze(A, B, hours):
     clock = {"median": med(dts), "p5": dts[len(dts) // 20] if dts else NAN, "p95": dts[-max(1, len(dts) // 20)] if dts else NAN,
              "max_abs": max(abs(d) for d in dts) if dts else NAN, "wild": sum(1 for d in dsnr if abs(d) > 10)}
 
+    # where the neighbours are: positions from their own adverts (either node may have heard them), the
+    # radios' positions from openHop
+    adverts = advert_store(A.adverts(max(hours, ADVERT_LOOKBACK_H)), B.adverts(max(hours, ADVERT_LOOKBACK_H)))
+    geo = geo_build(A.position(), B.position(), neighbours, adverts)
+
     return {
         "generated": time.time(), "start": start, "end": end, "bucket": bucket,
         "A": {"name": A.name, "url": A.url, "n": len(pa), "only": only_a, "rssi": ra, "snr": sa,
@@ -266,7 +407,7 @@ def analyze(A, B, hours):
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
-        "one_sided": one_sided,
+        "one_sided": one_sided, "geo": geo,
         "shared": {"pairs": len(sh_pairs), "only_a": len(sh_only_a), "only_b": len(sh_only_b),
                    "deep_a": sum(1 for p, _ in sh_pairs if p["snr"] + shift["a"] < DEEP_DB) + sum(1 for p in sh_only_a if p["snr"] + shift["a"] < DEEP_DB),
                    "deep_b": sum(1 for _, q in sh_pairs if q["snr"] + shift["b"] < DEEP_DB) + sum(1 for q in sh_only_b if q["snr"] + shift["b"] < DEEP_DB)},
@@ -322,6 +463,13 @@ def print_report(R):
     for s in R["neighbours"][:25]:
         print(f"  {s['hop']:>6} {s['both']:5d} {s['a']:6d} {s['b']:6d}  {fmt(s['rssi_a'],7)} {fmt(s['rssi_b'],7)} {fmt(s['drssi'],6)}  "
               f"{fmt(s['snr_a'],6,2)} {fmt(s['snr_b'],6,2)} {fmt(s['dsnr'],6,2)}")
+    g = R["geo"]
+    if g["mid"]:
+        print("-" * 96)
+        print(f"Positions: A {g['a'][0]:.5f},{g['a'][1]:.5f}  B {g['b'][0]:.5f},{g['b'][1]:.5f}  ({1000*g['apart']:.0f} m apart); "
+              f"{len(g['nb'])} neighbours placed from {g['adverts']} adverts, {len(g['unplaced'])} without a position, {len(g['ambiguous'])} ambiguous")
+        for n in sorted(g["nb"], key=lambda n: n["d"])[:25]:
+            print(f"  {n['hop']:>6} {n['brg']:4.0f}° {n['d']:6.1f} km  {n['name']}")
 
 
 def write_csv(R, path):
@@ -395,6 +543,29 @@ th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}.hit.pick{cursor:pointer}
 details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
 #tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}#tip.wide{white-space:pre-wrap;max-width:min(340px,calc(100vw - 24px));line-height:1.45;padding:8px 10px}
+/* where the neighbours are */
+#geo .seg{display:inline-flex;border:1px solid var(--axis);border-radius:6px;overflow:hidden;margin-left:8px}#geo .seg button{font:inherit;font-size:13px;color:var(--ink2);background:var(--surface);border:0;padding:5px 11px;cursor:pointer}
+#geo .seg button+button{border-left:1px solid var(--axis)}#geo .seg button.on{background:var(--ink);color:var(--surface)}#geo .seg button:focus-visible{outline:2px solid var(--a);outline-offset:-2px}
+#geo .legend .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--muted);margin-right:5px;vertical-align:-1px}#geo .legend .dot.small{width:6px;height:6px;margin-right:3px}
+#geo .legend .dot.split{width:13px;height:13px;background:linear-gradient(to right,var(--a) 65%,var(--b) 65%);vertical-align:-2px}
+#geo .legend .dot.win{width:11px;height:11px;background:linear-gradient(to right,var(--a) 35%,var(--b) 35%);box-shadow:0 0 0 1px var(--surface),0 0 0 3px var(--b);margin:0 9px 0 4px}
+#geo .legend .dot.os{width:11px;height:11px;background:linear-gradient(to right,var(--a) 90%,var(--b) 90%);box-shadow:0 0 0 1px var(--surface),0 0 0 3px var(--a),0 0 0 4px var(--ink);margin:0 10px 0 5px}
+.geo-dot{display:block;border-radius:50%}#geo-tbl .sw{margin-left:4px;margin-right:10px}
+#geo .legend .line{display:inline-block;width:22px;height:0;border-top:2px solid var(--muted);opacity:.45;margin-right:6px;vertical-align:3px}
+#geo-radar svg{overflow:visible}.lbl.hop{font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--surface);stroke-width:3px;stroke-linejoin:round}.ring{fill:none;stroke:var(--grid)}.ring.major{stroke:var(--axis)}.spoke{stroke:var(--grid)}.compass{fill:var(--ink2);font-size:12px;font-weight:600}
+#geo-map{width:100%;aspect-ratio:1;min-height:320px;border-radius:6px;overflow:hidden;background:var(--plane);border:1px solid var(--grid);position:relative}
+#geo-map .geo-load{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--ink2);font-size:13px;text-align:center;padding:16px}
+#geo-map.leaflet-container{font:inherit;background:var(--plane)}
+/* tiles are desaturated so the only colour on the map is the data; MAP_GRAY=0 keeps the tiles' own colours */
+#geo-map .leaflet-tile-pane{opacity:.9}#geo-map.gray .leaflet-tile-pane{filter:grayscale(1) contrast(.9);opacity:.75}
+#geo-map.dark .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.85) saturate(.5)}#geo-map.dark.gray .leaflet-tile-pane{filter:grayscale(1) invert(1) brightness(.75) contrast(.8);opacity:.7}#geo-map svg{width:auto;height:auto;overflow:hidden}   /* the report's svg{width:100%} rule must not touch Leaflet's overlay */
+#geo-map .leaflet-control-attribution{background:color-mix(in srgb,var(--surface) 80%,transparent);color:var(--muted);font-size:10px}#geo-map .leaflet-control-attribution a{color:var(--ink2)}
+#geo-map .leaflet-bar{border:1px solid var(--border);box-shadow:none}#geo-map .leaflet-bar a{background:var(--surface);color:var(--ink);border-bottom-color:var(--grid)}
+#geo-map .leaflet-tooltip.geo-tip{background:var(--ink);color:var(--surface);border:0;box-shadow:none;border-radius:6px;padding:6px 8px;font-size:12px;line-height:1.45;white-space:pre}#geo-map .leaflet-tooltip.geo-tip:before{display:none}
+#geo-map .leaflet-tooltip.geo-lbl{background:transparent;border:0;box-shadow:none;color:var(--ink2);padding:0;font-size:11px;text-shadow:0 0 3px var(--surface),0 0 3px var(--surface),0 0 3px var(--surface)}#geo-map .leaflet-tooltip.geo-lbl:before{display:none}#geo-map .leaflet-tooltip.geo-lbl.hop{font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.geo-site{display:block;width:24px;height:24px;border-radius:50%;overflow:hidden;box-shadow:0 0 0 2.5px var(--surface),0 1px 4px rgba(0,0,0,.25);position:relative}.geo-site i{position:absolute;top:0;bottom:0;width:50%}.geo-site .ha{left:0;background:var(--a)}.geo-site .hb{right:0;background:var(--b)}.geo-site:after{content:"";position:absolute;left:50%;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--surface)}
+.geo-radio{display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;color:#fff;font-size:11px;font-weight:700;box-shadow:0 0 0 2.5px var(--surface),0 1px 4px rgba(0,0,0,.25)}.geo-radio.a{background:var(--a)}.geo-radio.b{background:var(--b)}
+#geo-tbl td.win-a{color:var(--a);font-weight:600}#geo-tbl td.win-b{color:var(--b);font-weight:600}#geo-tbl .k{color:var(--muted);font-size:11px;margin-left:4px}#geo-tbl tr.on td{background:var(--plane)}#geo-tbl .sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--muted);color:var(--muted);font-size:9.5px;font-weight:700;font-style:normal;line-height:1;margin-left:5px;vertical-align:.1em;cursor:help;user-select:none}.info:hover{border-color:var(--ink2);color:var(--ink2)}
 """
 
@@ -471,6 +642,194 @@ sel.addEventListener('change',()=>render(+sel.value));
 document.querySelectorAll('[data-hop]').forEach(el=>el.addEventListener('click',()=>{const i=EX.hops.indexOf(el.dataset.hop);if(i<0)return;sel.value=i;render(i);document.getElementById('explore').scrollIntoView({behavior:'smooth',block:'start'})}));
 const m=location.hash.match(/^#hop=(.+)$/);const init=m?EX.hops.indexOf(decodeURIComponent(m[1])):-1;
 if(init>=0)sel.value=init;render(+sel.value);
+})();
+"""
+
+
+GEO_JS = r"""
+// ---- where the neighbours are: radar (inline SVG), map (Leaflet, loaded on demand), SNR against distance,
+// rendered client-side from the embedded positions so the three views share one selection
+(function(){
+const G=window.GEO; if(!G||!G.mid) return;
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const tok=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const isDark=()=>{const d=document.documentElement.dataset.theme;return d==='dark'||(d!=='light'&&matchMedia('(prefers-color-scheme: dark)').matches)};
+const compass=b=>['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(b/22.5)%16];
+const fmtKm=d=>d<1?`${Math.round(d*1000)} m`:`${d.toFixed(1)} km`;
+const pct=v=>`${Math.round(100*v)}%`, db=v=>v==null?'–':(v>0?'+':'')+v.toFixed(1);
+// local km frame around the midpoint (equirectangular; fine at the tens of km a LoRa hop covers)
+const KM=111.32, cosL=Math.cos(G.mid[0]*Math.PI/180);
+const xy=ll=>[(ll[1]-G.mid[1])*KM*cosL,(ll[0]-G.mid[0])*KM];
+const N=G.nb.map(n=>{const p=xy(n.ll);return {...n,x:p[0],y:p[1]}});
+const two=G.apart>1, PA=xy(G.a), PB=xy(G.b), NMAX=Math.max(1,...N.map(n=>n.pk));
+const NA=G.na, NB=G.nb_;
+let colourBy='rate', picked=null;
+
+// each neighbour is a circle filled left to right: A's share of the two decode rates in A's colour, the rest in B's
+// (half and half is level, all one colour is one-sided); by SNR, 6 dB either way fills the circle
+const frac=n=>colourBy==='rate'?(n.ra+n.rb?n.ra/(n.ra+n.rb):.5):(n.sa!=null&&n.sb!=null?Math.min(1,Math.max(0,.5-(n.sb-n.sa)/12)):.5);
+// the outline is the node that decodes more (same 3 pp threshold as the tables); level neighbours keep a plain outline
+const winner=n=>n.ra-n.rb>.03?'a':n.rb-n.ra>.03?'b':null;
+function splitCircle(cx,cy,r,n){const A=tok('--a'),B=tok('--b'),surf=tok('--surface'),f=frac(n),w=winner(n),x=cx-r+2*r*f,h=Math.sqrt(Math.max(0,r*r-(x-cx)**2));
+  let s=f>=.995?`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${A}"/>`:`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${B}"/>`
+    +(f>.005&&f<.995?`<path d="M${x.toFixed(2)} ${(cy-h).toFixed(2)} A${r} ${r} 0 ${f>.5?1:0} 0 ${x.toFixed(2)} ${(cy+h).toFixed(2)} Z" fill="${A}"/>`:'');
+  s+=`<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${surf}" stroke-width="2"/>`;   // hairline of surface, then the winner's ring
+  if(w)s+=`<circle cx="${cx}" cy="${cy}" r="${r+2}" fill="none" stroke="${w==='a'?A:B}" stroke-width="2"/>`;
+  if(n.os)s+=`<circle cx="${cx}" cy="${cy}" r="${r+4}" fill="none" stroke="var(--ink)" stroke-width="1"/>`;
+  return s}
+const gradient=n=>{const f=(100*frac(n)).toFixed(0);return `linear-gradient(to right,${tok('--a')} ${f}%,${tok('--b')} ${f}%)`};
+const rings=n=>{const w=winner(n),ring=w?`,0 0 0 3px ${tok(w==='a'?'--a':'--b')}`:'';return `0 0 0 1px ${tok('--surface')}${ring}${n.os?`,0 0 0 ${w?4:2}px ${tok('--ink')}`:''}`};
+const size=pk=>4+9*Math.sqrt(pk/NMAX), evid=pk=>.18+.5*Math.sqrt(pk/NMAX);
+const tipFor=n=>`${n.hop}${n.name?' · '+n.name:''}\n${compass(n.brg)} ${Math.round(n.brg)}° · ${two?`A ${fmtKm(n.da)} / B ${fmtKm(n.db)}`:fmtKm(n.d)}\n${n.pk} packets · heard by A ${pct(n.ra)} · B ${pct(n.rb)}\nSNR on matched  A ${db(n.sa)} · B ${db(n.sb)} dB${n.os?'\n◐ one-sided: heard from one position only':''}`;
+const pick=hop=>{picked=picked===hop?null:hop;render();
+  // also put it in the explorer, without scrolling there
+  const sel=document.getElementById('ex-hop');if(!sel||picked==null)return;const i=[...sel.options].findIndex(o=>o.text.startsWith(hop+' '));if(i>=0){sel.value=i;sel.dispatchEvent(new Event('change'))}};
+
+// ---- radar: log-polar around the midpoint; both radios go through the same projection
+function drawRadar(){
+  const W=600,C=300,R=248,R0=0.5;
+  const RMAX=Math.max(25,...N.map(n=>n.d))*1.08;
+  const rings=[1,2,5,10,20,50,100,200,500].filter(r=>r<RMAX*.97), major=rings[rings.length-2];
+  // ring labels go down the spoke with the fewest neighbours nearby
+  const spokes=[...Array(12)].map((_,i)=>i*30+15), lblA=spokes.reduce((best,a)=>{const gap=Math.min(...N.map(n=>Math.abs(((n.brg-a+540)%360)-180)));return gap>best[1]?[a,gap]:best},[210,-1])[0]*Math.PI/180;
+  const surf=tok('--surface'),A=tok('--a'),B=tok('--b');
+  const rad=d=>R*Math.log(Math.max(d,R0*1.1)/R0)/Math.log(RMAX/R0);
+  const pt=p=>{const d=Math.hypot(p[0],p[1]),b=Math.atan2(p[0],p[1]);return [C+rad(d)*Math.sin(b),C-rad(d)*Math.cos(b)]};
+  let s=[];
+  for(let a=0;a<360;a+=30){const t=a*Math.PI/180;s.push(`<line class="spoke" x1="${C}" y1="${C}" x2="${(C+R*Math.sin(t)).toFixed(1)}" y2="${(C-R*Math.cos(t)).toFixed(1)}" stroke-dasharray="${a%90?'2 4':'none'}"/>`)}
+  for(const d of rings){const r=rad(d);s.push(`<circle class="ring${d===major?' major':''}" cx="${C}" cy="${C}" r="${r.toFixed(1)}"/><text class="lbl" x="${(C+r*Math.sin(lblA)).toFixed(1)}" y="${(C-r*Math.cos(lblA)+(lblA<Math.PI?-4:12)).toFixed(1)}" text-anchor="${lblA<Math.PI?'start':'end'}">${d} km</text>`)}
+  s.push(`<circle class="ring" cx="${C}" cy="${C}" r="${R}" style="stroke:var(--axis)"/>`);
+  for(const [t,dx,dy] of [['N',0,-1],['E',1,0],['S',0,1],['W',-1,0]])s.push(`<text class="compass" x="${C+dx*(R+18)}" y="${C+dy*(R+18)+4}" text-anchor="middle">${t}</text>`);
+  for(const n of N){const p=pt([n.x,n.y]);
+    if(two)for(const [r,v,rate] of [[PA,A,n.ra],[PB,B,n.rb]]){const q=pt(r);s.push(`<line x1="${q[0].toFixed(1)}" y1="${q[1].toFixed(1)}" x2="${p[0].toFixed(1)}" y2="${p[1].toFixed(1)}" stroke="${v}" stroke-width="1.5" opacity="${(evid(n.pk)*rate).toFixed(2)}"/>`)}
+    else s.push(`<line x1="${C}" y1="${C}" x2="${p[0].toFixed(1)}" y2="${p[1].toFixed(1)}" stroke="var(--muted)" stroke-width="1.5" opacity="${evid(n.pk).toFixed(2)}"/>`)}
+  if(two){
+    for(const [k,r,v] of [['A',PA,A],['B',PB,B]]){const q=pt(r);s.push(`<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="10" fill="${v}" stroke="${surf}" stroke-width="2.5"/><text x="${q[0].toFixed(1)}" y="${(q[1]+4).toFixed(1)}" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">${k}</text>`)}
+    const a=pt(PA),b=pt(PB);s.push(`<text class="lbl" x="${((a[0]+b[0])/2).toFixed(1)}" y="${(Math.max(a[1],b[1])+22).toFixed(1)}" text-anchor="middle">${fmtKm(G.apart)} apart</text>`);
+  }else{
+    s.push(`<path d="M${C-11} ${C} A11 11 0 0 1 ${C+11} ${C} Z" fill="${A}"/><path d="M${C+11} ${C} A11 11 0 0 1 ${C-11} ${C} Z" fill="${B}"/><circle cx="${C}" cy="${C}" r="11" fill="none" stroke="${surf}" stroke-width="2.5"/><line x1="${C-11}" y1="${C}" x2="${C+11}" y2="${C}" stroke="${surf}" stroke-width="2"/>`);
+  }
+  for(const n of N){const p=pt([n.x,n.y]),r=size(n.pk),hi=picked===n.hop;
+    const mark=splitCircle(+p[0].toFixed(1),+p[1].toFixed(1),r,n);
+    s.push(`<g class="mark">${hi?`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${r+7}" fill="none" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="3 2"/>`:''}${mark}<text class="lbl hop" x="${(p[0]+r+7).toFixed(1)}" y="${(p[1]+4).toFixed(1)}">${esc(n.hop)}</text></g>`);
+    s.push(`<circle class="hit pick" data-geo="${esc(n.hop)}" data-tip="${esc(tipFor(n))}" cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${Math.max(r+6,12)}"></circle>`)}
+  document.getElementById('geo-radar').innerHTML=`<svg viewBox="-24 -24 ${W+48} ${W+48}" xmlns="http://www.w3.org/2000/svg">${s.join('')}</svg>`;
+}
+
+// ---- map: Leaflet and the tiles come from the internet, so only on request (remembered per browser)
+let map=null,layer=null,mapState='idle';
+function loadMap(){
+  if(mapState!=='idle')return;mapState='loading';
+  const box=document.getElementById('geo-map');box.innerHTML='<div class="geo-load">loading map…</div>';
+  // wait for the stylesheet as well as the script: Leaflet measures tooltips when they are created, and without its CSS they are block-wide
+  const css=document.createElement('link');css.rel='stylesheet';css.href='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css';document.head.appendChild(css);
+  const js=document.createElement('script');js.src='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
+  let pending=2;const ready=()=>{if(--pending)return;mapState='ready';box.innerHTML='';box.classList.toggle('dark',isDark());box.classList.toggle('gray',!!G.map_gray);
+    map=L.map(box,{zoomSnap:.5}).setView(G.mid,10);
+    L.tileLayer(G.tiles,{maxZoom:17,attribution:G.attrib}).addTo(map);
+    layer=L.layerGroup().addTo(map);
+    map.fitBounds(L.latLngBounds([G.a,G.b,...N.map(n=>n.ll)]).pad(.06));
+    try{localStorage.setItem('rxcompare-map','1')}catch(e){}
+    drawMap()};
+  css.onload=ready;js.onload=ready;
+  js.onerror=()=>{mapState='idle';box.innerHTML='<div class="geo-load">could not load Leaflet — offline? <button class="select" id="geo-map-btn">try again</button></div>';document.getElementById('geo-map-btn').onclick=loadMap};
+  document.head.appendChild(js);
+}
+function drawMap(){
+  if(!map)return;
+  const surf=tok('--surface'),A=tok('--a'),B=tok('--b'),ink=tok('--ink');
+  document.getElementById('geo-map').classList.toggle('dark',isDark());
+  layer.clearLayers();
+  for(const n of N){
+    if(two)for(const [r,c,rate] of [[G.a,A,n.ra],[G.b,B,n.rb]])L.polyline([r,n.ll],{color:c,weight:1.5,opacity:evid(n.pk)*rate,interactive:false}).addTo(layer);
+    else L.polyline([G.mid,n.ll],{color:tok('--muted'),weight:1.5,opacity:evid(n.pk),interactive:false}).addTo(layer)}
+  if(two){
+    for(const [k,r] of [['A',G.a],['B',G.b]])L.marker(r,{icon:L.divIcon({className:'',html:`<span class="geo-radio ${k.toLowerCase()}">${k}</span>`,iconSize:[22,22],iconAnchor:[11,11]}),interactive:false}).addTo(layer);
+    L.marker(G.mid,{icon:L.divIcon({className:'',html:'',iconSize:[0,0]}),interactive:false}).bindTooltip(`${fmtKm(G.apart)} apart`,{permanent:true,direction:'bottom',className:'geo-lbl',offset:[0,10]}).addTo(layer);
+  }else L.marker(G.mid,{icon:L.divIcon({className:'',html:'<span class="geo-site"><i class="ha"></i><i class="hb"></i></span>',iconSize:[24,24],iconAnchor:[12,12]}),keyboard:false})
+      .bindTooltip(`${esc(NA)} and ${esc(NB)}, ${fmtKm(G.apart)} apart`,{direction:'top',offset:[0,-14],className:'geo-tip'}).addTo(layer);
+  for(const n of N){const r=size(n.pk),hi=picked===n.hop;
+    if(hi)L.circleMarker(n.ll,{radius:r+7,fill:false,color:ink,weight:1.5,dashArray:'3 2',interactive:false}).addTo(layer);
+    const m=L.marker(n.ll,{icon:L.divIcon({className:'',html:`<span class="geo-dot" style="width:${2*r}px;height:${2*r}px;background:${gradient(n)};box-shadow:${rings(n)}"></span>`,iconSize:[2*r,2*r],iconAnchor:[r,r]}),keyboard:false}).addTo(layer);
+    m.bindTooltip(tipFor(n),{sticky:true,direction:'top',offset:[0,-r-4],className:'geo-tip'});m.on('click',()=>pick(n.hop));
+    L.marker(n.ll,{icon:L.divIcon({className:'',html:'',iconSize:[0,0]}),interactive:false}).bindTooltip(esc(n.hop),{permanent:true,direction:'right',className:'geo-lbl hop',offset:[r+6,0]}).addTo(layer)}
+}
+
+// ---- SNR against distance: one point per node per neighbour, a straight fit through log(distance)
+function fit(pts){const n=pts.length;if(n<3)return null;const mx=pts.reduce((a,p)=>a+p[0],0)/n,my=pts.reduce((a,p)=>a+p[1],0)/n;
+  const sxy=pts.reduce((a,p)=>a+(p[0]-mx)*(p[1]-my),0),sxx=pts.reduce((a,p)=>a+(p[0]-mx)**2,0);if(!sxx)return null;const m=sxy/sxx;return [m,my-m*mx]}
+function drawSnr(){
+  const out=document.getElementById('geo-snr'),sub=document.getElementById('geo-snr-sub');
+  const pts=N.flatMap(n=>[[n,n.da,n.sa,'a'],[n,n.db,n.sb,'b']]).filter(p=>p[2]!=null);
+  if(pts.length<4){out.innerHTML='<p>not enough neighbours with a position and matched packets yet</p>';sub.textContent='';return}
+  const W=520,H=300,ml=38,mr=12,mt=10,mb=28;
+  const ds=pts.map(p=>p[1]),ss=pts.map(p=>p[2]);
+  const xlo=Math.min(1,...ds)*0.8,xhi=Math.max(30,...ds)*1.2,ylo=Math.floor((Math.min(-16,...ss)-1)/5)*5,yhi=Math.ceil((Math.max(14,...ss)+1)/5)*5;
+  const X=v=>ml+(Math.log10(v)-Math.log10(xlo))/(Math.log10(xhi)-Math.log10(xlo))*(W-ml-mr),Y=v=>mt+(yhi-v)/(yhi-ylo)*(H-mt-mb);
+  const A=tok('--a'),B=tok('--b'),surf=tok('--surface');
+  let s=['<g class="ax">'];
+  for(let v=ylo;v<=yhi;v+=5)s.push(`<line x1="${ml}" x2="${W-mr}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>`+(v<yhi?`<text x="${ml-6}" y="${(Y(v)+4).toFixed(1)}" text-anchor="end">${v>0?'+':''}${v}</text>`:''));
+  for(const v of [0.5,1,2,5,10,20,50,100,200,500])if(v>=xlo&&v<=xhi)s.push(`<line y1="${mt}" y2="${H-mb}" x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}"/><text x="${X(v).toFixed(1)}" y="${H-mb+15}" text-anchor="middle">${v} km</text>`);
+  s.push(`<text x="${ml-6}" y="${mt-2}" text-anchor="end" style="fill:var(--ink2)">dB</text></g>`);
+  const fA=fit(pts.filter(p=>p[3]==='a').map(p=>[Math.log10(p[1]),p[2]])),fB=fit(pts.filter(p=>p[3]==='b').map(p=>[Math.log10(p[1]),p[2]]));
+  const line=(f,c)=>f?`<line x1="${X(xlo)}" y1="${Y(f[0]*Math.log10(xlo)+f[1]).toFixed(1)}" x2="${X(xhi)}" y2="${Y(f[0]*Math.log10(xhi)+f[1]).toFixed(1)}" stroke="${c}" stroke-width="2" opacity=".55"/>`:'';
+  s.push(line(fA,A),line(fB,B));
+  for(const n of N){const hi=picked===n.hop;
+    if(n.sa!=null&&n.sb!=null)s.push(`<line x1="${X(n.da).toFixed(1)}" y1="${Y(n.sa).toFixed(1)}" x2="${X(n.db).toFixed(1)}" y2="${Y(n.sb).toFixed(1)}" stroke="var(--muted)" stroke-width="${hi?2:1}" opacity="${hi?.9:.45}"/>`);
+    for(const [d,v,c] of [[n.da,n.sa,A],[n.db,n.sb,B]]){if(v==null)continue;
+      s.push(`<circle class="hit pick" data-geo="${esc(n.hop)}" data-tip="${esc(tipFor(n))}" cx="${X(d).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="9"/><circle class="mark" cx="${X(d).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="${hi?6:4.5}" fill="${c}" stroke="${surf}" stroke-width="1.5" pointer-events="none"/>`)}
+    if(hi&&(n.sa!=null||n.sb!=null))s.push(`<text class="lbl hop" x="${(X(Math.max(n.da,n.db))+9).toFixed(1)}" y="${(Y(n.sa??n.sb)+4).toFixed(1)}">${esc(n.hop)}</text>`)}
+  out.innerHTML=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${s.join('')}</svg>`;
+  if(fA&&fB){const at=Math.log10(10),gap=(fA[0]*at+fA[1])-(fB[0]*at+fB[1]);
+    sub.innerHTML=`Each neighbour once per node, on that node's own scale. The fitted lines are the two receivers with distance taken out: at 10 km <span class="ch a">A</span>sits <b>${Math.abs(gap).toFixed(1)} dB ${gap>=0?'above':'below'}</b> <span class="ch b">B</span>.`}
+  else sub.textContent='Each neighbour once per node, on that node\'s own scale.';
+}
+
+// ---- reading: is the difference directional?
+function circ(bs){const x=bs.reduce((a,b)=>a+Math.sin(b*Math.PI/180),0),y=bs.reduce((a,b)=>a+Math.cos(b*Math.PI/180),0);
+  const m=(Math.atan2(x,y)*180/Math.PI+360)%360,dev=Math.max(...bs.map(b=>Math.abs(((b-m+540)%360)-180)));return {m,dev}}
+const tight=ns=>ns.length>=2&&circ(ns.map(n=>n.brg)).dev<=45;
+function sector(ns){if(!ns.length)return '';const c=circ(ns.map(n=>n.brg));return tight(ns)?`towards the ${compass(c.m)} (${ns.map(n=>n.hop).join(', ')}: ${Math.round(c.m)}° ± ${Math.round(c.dev)}°)`:ns.length===1?`on one neighbour (${ns[0].hop}, ${compass(ns[0].brg)})`:`all round (${ns.map(n=>n.hop).join(', ')})`}
+function drawReading(){
+  const li=[],os=N.filter(n=>n.os),tot=N.length+G.unplaced.length+G.ambiguous.length;
+  if(two){
+    li.push(`The radios are <b>${fmtKm(G.apart)} apart</b>, so the neighbours split by which one is closer — <b>that is the expected picture</b>, not a receiver difference. Each neighbour's brighter line runs to the nearer radio.`);
+    if(os.length)li.push(`${os.length} one-sided neighbour${os.length===1?'':'s'} (${os.map(n=>n.hop).join(', ')}) — normal at this separation, and why the headline keeps the shared-neighbours rate for the receiver question.`);
+    li.push(`To compare the <b>receivers</b>, use SNR against distance: with distance taken out, the two fits overlap if the radios are equal.`);
+  }else{
+    const lead=N.filter(n=>n.pk>=20&&Math.abs(n.ra-n.rb)>=.1),la=lead.filter(n=>n.ra>n.rb),lb=lead.filter(n=>n.rb>n.ra);
+    if(!lead.length)li.push(`No neighbour with 20+ packets is heard 10 pp better by one radio than the other: <b>the positions are not splitting the neighbours</b>, so any difference in the headline is the receivers.`);
+    else{
+      const dir=tight(la)||tight(lb);
+      li.push((dir?`<b>The difference has a direction.</b> `:`<b>No direction to it.</b> `)+(la.length?`${esc(NA)} decodes more ${sector(la)}`:`${esc(NA)} leads nowhere`)+'; '+(lb.length?`${esc(NB)} decodes more ${sector(lb)}`:`${esc(NB)} leads nowhere`)+'. '+
+        (dir?`A difference by direction comes from the masts — antenna pattern, a wall, a roof edge — not from the boards.`:(la.length&&lb.length?`Each radio leads somewhere and the sectors do not separate, which points at the receivers rather than the masts.`:`One radio leads wherever there is a difference, which points at the receivers rather than the masts.`)));
+    }
+    if(os.length)li.push(`<b>${os.length} one-sided neighbour${os.length===1?'':'s'}</b>: ${os.map(n=>`${n.hop} (${compass(n.brg)}, ${fmtKm(n.d)}, heard by ${n.ra>n.rb?'A':'B'})`).join(', ')}.`);
+    const far=N.filter(n=>n.d>=20).length;if(far)li.push(`${far} neighbour${far===1?' is':'s are'} 20 km or more out — the radios are compared where it matters most, at the edge of range.`);
+  }
+  const miss=[];if(G.unplaced.length)miss.push(`${G.unplaced.length} sent no advert with a position (${G.unplaced.join(', ')})`);if(G.ambiguous.length)miss.push(`${G.ambiguous.length} match several adverts — a 1-byte hash is not unique (${G.ambiguous.join(', ')})`);
+  li.push(`${N.length} of ${tot} neighbours placed, from ${G.adverts} adverts either node heard in the last ${G.lookback} h${miss.length?': '+miss.join('; '):''}.`);
+  document.getElementById('geo-reading').innerHTML=li.map(x=>`<li>${x}</li>`).join('');
+}
+
+function drawTable(){
+  const rows=[...N].sort((a,b)=>a.d-b.d).map(n=>{const wa=n.ra-n.rb>.03,wb=n.rb-n.ra>.03;
+    return `<tr class="pick${picked===n.hop?' on':''}" data-geo="${esc(n.hop)}"><td><i class="sw" style="background:${gradient(n)};box-shadow:${rings(n)}"></i>${esc(n.hop)}${n.os?'<span class="k">◐</span>':''}</td><td style="text-align:left">${esc(n.name||'')}</td><td>${compass(n.brg)}<span class="k">${Math.round(n.brg)}°</span></td><td>${two?`${fmtKm(n.da)} / ${fmtKm(n.db)}`:fmtKm(n.d)}</td><td>${n.pk.toLocaleString()}</td><td class="${wa?'win-a':''}">${pct(n.ra)}</td><td class="${wb?'win-b':''}">${pct(n.rb)}</td><td>${db(n.sa)}</td><td>${db(n.sb)}</td></tr>`}).join('');
+  document.getElementById('geo-tbl').innerHTML=`<thead><tr><th>hop</th><th style="text-align:left">advertised name</th><th>bearing</th><th>${two?'distance A / B':'distance'}</th><th>packets</th><th>heard by ${esc(NA)}</th><th>heard by ${esc(NB)}</th><th>SNR ${esc(NA)}</th><th>SNR ${esc(NB)}</th></tr></thead><tbody>${rows}</tbody>`;
+}
+
+function render(){drawRadar();drawMap();drawSnr();drawReading();drawTable()}
+document.getElementById('geo').addEventListener('click',e=>{const t=e.target.closest('[data-geo]');if(t)pick(t.dataset.geo)});
+document.querySelectorAll('[data-cb]').forEach(b=>b.onclick=()=>{colourBy=b.dataset.cb;document.querySelectorAll('[data-cb]').forEach(x=>x.classList.toggle('on',x===b));render()});
+// rows elsewhere in the report select a neighbour: mirror it here
+document.addEventListener('click',e=>{const t=e.target.closest('[data-hop]');if(t&&N.some(n=>n.hop===t.dataset.hop)){picked=t.dataset.hop;render()}});
+const onTheme=()=>render();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',onTheme);
+new MutationObserver(onTheme).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+document.getElementById('geo-map-btn').onclick=loadMap;
+let auto=G.map_auto;try{auto=auto||localStorage.getItem('rxcompare-map')==='1'}catch(e){}
+if(auto)loadMap();
+render();
 })();
 """
 
@@ -895,6 +1254,9 @@ INFO = {
     "noise": "The node's own noise-floor measurement. Partly a calibration difference between boards, so compare its movement over time rather than the absolute level.",
     "level": "Δ SNR per 2 dB of signal level, using the mean of the two readings as the level so neither node's noise picks the bin. "
              "Flat means a fixed reporting offset; a slope or a bend near the floor means the radios genuinely differ there.",
+    "geo": "Neighbour positions come from the neighbours' own adverts (MeshCore adverts carry lat/lon when the node has one set), "
+           "matched to the hop hash, which is the first 1–3 bytes of the node's public key. The radios' positions come from openHop's GPS or manual position. "
+           "A 1-byte hash that several advertised keys start with is left off as ambiguous.",
     "curve": "For every transmission the reference node decoded at a given SNR (common scale), the share the other node also decoded. "
              "The higher curve is the more sensitive receiver. Only neighbours both positions hear are included.",
 }
@@ -998,7 +1360,9 @@ def render_html(R, nav="", refresh=0):
         reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
                        + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard(n)):.0f}% vs {100*min(heard(n)):.0f}%)" for n in one_sided)
                        + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
-                         "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
+                       + (f"— and the radios are {R['geo']['apart']:.1f} km apart, so this is expected. See <a href=\"#geo\">where the neighbours are</a>."
+                          if R["geo"]["mid"] and R["geo"]["apart"] > 1 else
+                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm."))
     reading_card = f'<div class="card reading"><h3>Reading{info("one_sided")}{info("scale")}</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
     # hero: what a mesh user asks first — which node hears more of what is on the air, and which one
@@ -1121,6 +1485,46 @@ def render_html(R, nav="", refresh=0):
                      f"<td>{fmt(n['rssi_a'],0,1)}</td><td>{fmt(n['rssi_b'],0,1)}</td><td>{fmt(n['drssi'],0,1)}</td>"
                      f"<td>{fmt(n['snr_a'],0,2)}</td><td>{fmt(n['snr_b'],0,2)}</td><td>{dcell}</td></tr>")
 
+    # ---- where the neighbours are: positions joined to the per-neighbour stats, rendered client-side
+    g = R["geo"]
+    nstat = {n["hop"]: n for n in R["neighbours"]}
+    geo_nb = []
+    for n_ in g["nb"]:
+        st_ = nstat[n_["hop"]]
+        u = st_["both"] + st_["a"] + st_["b"]
+        geo_nb.append({"hop": n_["hop"], "name": n_["name"], "ll": [round(n_["ll"][0], 5), round(n_["ll"][1], 5)],
+                       "d": round(n_["d"], 2), "brg": round(n_["brg"]), "da": round(n_["da"], 2), "db": round(n_["db"], 2), "pk": u,
+                       "ra": round((st_["both"] + st_["a"]) / u, 3), "rb": round((st_["both"] + st_["b"]) / u, 3),
+                       "sa": round(st_["snr_a"], 1) if st_["snr_a"] == st_["snr_a"] else None, "sb": round(st_["snr_b"], 1) if st_["snr_b"] == st_["snr_b"] else None,
+                       "os": n_["hop"] in os_hops})
+    geo = json.dumps({"a": g["a"], "b": g["b"], "mid": g["mid"], "apart": g["apart"] if g["mid"] else None, "nb": geo_nb,
+                      "unplaced": g["unplaced"], "ambiguous": g["ambiguous"], "adverts": g["adverts"], "lookback": int(max(span_h, ADVERT_LOOKBACK_H)),
+                      "na": na, "nb_": nb, "tiles": MAP_TILES, "attrib": MAP_ATTRIB, "map_auto": os.environ.get("MAP_AUTO", "").lower() in ("1", "true", "yes"), "map_gray": os.environ.get("MAP_GRAY", "1").lower() not in ("0", "false", "no")},
+                     separators=(",", ":")).replace("</", "<\\/")
+    far = g["mid"] and g["apart"] > 1
+    tile_host = MAP_TILES.split("/")[2].replace("{s}.", "") if MAP_TILES.count("/") >= 2 else MAP_TILES
+    geo_legend = ('<div class="legend"><span><span class="dot split"></span>share decoded by <span class="ch a">A</span>/ <span class="ch b">B</span></span>'
+                  '<span><span class="dot win"></span>ring: who decodes more</span><span><span class="dot small"></span><span class="dot"></span>packets</span>'
+                  '<span><span class="dot os"></span>one-sided</span><span><span class="line"></span>evidence</span></div>')
+    if not g["mid"]:
+        geo_section = (f'<section id="geo"><h2>Where the neighbours are{info("geo")}</h2><p class="meta">Neither node reports a position, so the neighbours cannot be placed. '
+                       f'Set the repeater\'s latitude/longitude in openHop (or A_LAT/A_LON, B_LAT/B_LON here) to get a map, a bearing-and-distance view and SNR against distance.</p></section>')
+    else:
+        geo_section = f"""<section id="geo">
+<h2>Where the neighbours are{info("geo")}</h2>
+<p class="meta">Every upstream neighbour whose advert carried a position, placed around the two radios ({1000*g['apart']:.0f} m apart). Each circle is filled left to right with the share of its transmissions each node decodes — half and half is level, all one colour is one-sided; size is how many packets that rests on.
+{"The radios are far enough apart that each neighbour is closer to one of them, so the split is geography; the receivers are compared with distance taken out, below." if far else "A pattern by <em>direction</em> is the mast, the antenna or something in the way — not the receiver."}</p>
+<div class="ctl" style="margin:0 0 14px;font-size:13px;color:var(--ink2)">Split by<span class="seg" role="group"><button class="on" data-cb="rate">Decode rate</button><button data-cb="snr">SNR</button></span></div>
+<div class="grid2">
+<div class="card"><h3>By bearing and distance</h3><p>Distance on a log scale, so the close ring and the far ring both get room. North is up. Click a neighbour to select it everywhere.</p>{geo_legend}<div id="geo-radar"></div></div>
+<div class="card"><h3>On the map</h3><p>Real terrain: zoom in to see what sits between the radios and a neighbour they miss. The map and its tiles load from the internet, so it is off until asked; your choice is remembered.</p>{geo_legend}<div id="geo-map"><div class="geo-load"><button class="select" id="geo-map-btn">Load the map</button><span>Leaflet from cdnjs, tiles from {esc(tile_host)}</span></div></div></div>
+<div class="card reading"><h3>Reading</h3><ul id="geo-reading"></ul></div>
+<div class="card"><h3>SNR against distance</h3><p id="geo-snr-sub"></p>{leg}<div id="geo-snr"></div></div>
+</div>
+<details><summary>Placed neighbours ({len(geo_nb)} rows)</summary><div class="card wrap"><table id="geo-tbl"></table></div></details>
+</section>
+"""
+
     # ---- bucket table (table view for the time charts)
     brows = "".join(f"<tr><td>{tlabel(b['t'])}</td><td>{b['a']}</td><td>{b['b']}</td><td>{b['both']}</td>"
                     f"<td>{fmt(100*brate(b,'a'),0,0)}%</td><td>{fmt(100*brate(b,'b'),0,0)}%</td>"
@@ -1152,7 +1556,7 @@ def render_html(R, nav="", refresh=0):
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
 A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
 Neither node transmits, so the share of the traffic each one decoded is a clean receive comparison; SNR on shared packets explains it. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
-<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#matched">Matched</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
+<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#matched">Matched</a><a href="#neighbours">Neighbours</a><a href="#geo">Map</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
 <section id="overview" class="first">
 <div class="top">{"".join(tiles)}</div>
@@ -1199,6 +1603,7 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 </div>
 </section>
 
+{geo_section}
 <section id="explore">
 <h2>Explore a neighbour</h2>
 <p class="meta">Everything in this panel is one neighbour's packets in the current window. Pick one here, or click a row in any neighbour chart or table.</p>
@@ -1237,7 +1642,7 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <details><summary>All matched packets ({npair} rows)</summary><div class="card wrap"><table><thead><tr><th>time</th><th>hop</th><th>type</th><th>len</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ</th></tr></thead><tbody>{prow}</tbody></table></div></details>
 </section>
-</main><div id="tip"></div><script>window.EXPLORE={explore};</script><script>{JS}</script></body></html>"""
+</main><div id="tip"></div><script>window.EXPLORE={explore};window.GEO={geo};</script><script>{JS}</script><script>{GEO_JS}</script></body></html>"""
     return doc
 
 
@@ -1271,7 +1676,7 @@ def summary(R):
                 **floor_stats(n, sh_)}
     union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
     d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
-         "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"],
+         "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"], "geo": R["geo"],
          "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),
@@ -1295,11 +1700,13 @@ def main():
         ap.add_argument(f"--{s}-url", default=os.environ.get(f"{s.upper()}_URL"))
         ap.add_argument(f"--{s}-key", default=os.environ.get(f"{s.upper()}_KEY"))
         ap.add_argument(f"--{s}-name", default=os.environ.get(f"{s.upper()}_NAME", s.upper()))
+        ap.add_argument(f"--{s}-lat", default=os.environ.get(f"{s.upper()}_LAT"), help="override the position openHop reports")
+        ap.add_argument(f"--{s}-lon", default=os.environ.get(f"{s.upper()}_LON"))
     args = ap.parse_args()
     if not all((args.a_url, args.a_key, args.b_url, args.b_key)):
         sys.exit("need A_URL/A_KEY/B_URL/B_KEY (env or flags)")
-    A = Node(args.a_name, args.a_url, args.a_key)
-    B = Node(args.b_name, args.b_url, args.b_key)
+    A = Node(args.a_name, args.a_url, args.a_key, args.a_lat, args.a_lon)
+    B = Node(args.b_name, args.b_url, args.b_key, args.b_lat, args.b_lon)
     while True:
         try:
             R = analyze(A, B, args.hours)

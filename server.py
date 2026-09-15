@@ -7,7 +7,7 @@ Routes:
   /healthz          200 once the first analysis has succeeded
 
 Config via environment (see .env.example): A_URL A_KEY A_NAME B_URL B_KEY B_NAME
-HOURS REFRESH_SEC PORT VERIFY_TLS RANGES
+HOURS REFRESH_SEC PORT VERIFY_TLS RANGES, plus the map settings in rxcompare.py
 """
 import html, json, os, sys, threading, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,8 +21,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 RANGES = [float(x) for x in os.environ.get("RANGES", "1,3,6,12,24,48").split(",")]
 MAX_HOURS = 168.0
 
-A = rx.Node(os.environ.get("A_NAME", "A"), os.environ.get("A_URL", ""), os.environ.get("A_KEY", ""))
-B = rx.Node(os.environ.get("B_NAME", "B"), os.environ.get("B_URL", ""), os.environ.get("B_KEY", ""))
+A = rx.Node(os.environ.get("A_NAME", "A"), os.environ.get("A_URL", ""), os.environ.get("A_KEY", ""), os.environ.get("A_LAT"), os.environ.get("A_LON"))
+B = rx.Node(os.environ.get("B_NAME", "B"), os.environ.get("B_URL", ""), os.environ.get("B_KEY", ""), os.environ.get("B_LAT"), os.environ.get("B_LON"))
 
 _cache = {}          # hours -> {"ts", "html", "summary"}
 _locks = {}          # hours -> Lock, so concurrent requests don't both hit the repeaters
