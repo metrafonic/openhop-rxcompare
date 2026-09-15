@@ -223,11 +223,11 @@ def print_report(R):
           f"({(R['end']-R['start'])/3600:.2f}h)   A={A['name']} ({A['url']})   B={B['name']} ({B['url']})")
     print("=" * 96)
     print(f"{'':{W}}  {'packets':>8} {'matched':>8} {'only':>6} {'RSSI avg':>9} {'RSSI med':>9} "
-          f"{'SNR avg':>8} {'SNR med':>8} {'noise avg':>10} {'noise min':>10} {'CRC err':>8}")
+          f"{'SNR avg':>8} {'SNR med':>8} {'SNR min':>8} {f'<{DEEP_DB}dB':>7} {'noise avg':>10} {'noise min':>10} {'CRC err':>8}")
     for n in (A, B):
-        nz = [v for _, v in n["noise"]]
+        nz = [v for _, v in n["noise"]]; fs = floor_stats(n)
         print(f"{n['name']:{W}}  {n['n']:8d} {len(pairs):8d} {len(n['only']):6d} {fmt(mean(n['rssi']),9)} {fmt(med(n['rssi']),9)} "
-              f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
+              f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(fs['snr_min'],8,1)} {fs['deep']:7d} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
     print("-" * 96)
     if pairs:
         better_b = sum(1 for d in drssi if d > 0); better_a = sum(1 for d in drssi if d < 0)
@@ -311,7 +311,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 .sbar{margin:8px 0 4px}.sbar .bar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.sbar .bar i{display:block;height:100%}.sbar .a{background:var(--a)}.sbar .b{background:var(--b)}.sbar .n{background:var(--axis)}
 .sbar .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.sbar .seg span{text-align:center;overflow:hidden}.sbar .seg span.l{text-align:left;overflow:visible}.sbar .seg span.r{text-align:right;overflow:visible;direction:rtl}
 
-.nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}
+.nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}.nodes small{color:var(--muted);font-size:11px;margin-left:2px}
 .nodes td,.nodes th{width:1%}.nodes td:last-child{width:auto;text-align:left;font-size:12px;padding-left:18px}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:28px}
 @media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
 .nodes .sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
@@ -717,8 +717,7 @@ def render_html(R, nav="", refresh=0):
     leg = f'<div class="legend"><span><span class="ch a">A</span>{esc(na)}</span><span><span class="ch b">B</span>{esc(nb)}</span></div>'
 
     # ---- headline row + per-node table
-    weak_a = sum(1 for v in A['snr'] + [p['snr'] for p in A['only']] if v < -5)
-    weak_b = sum(1 for v in B['snr'] + [p['snr'] for p in B['only']] if v < -5)
+    fa, fb = floor_stats(A), floor_stats(B)
     union = npair + len(A["only"]) + len(B["only"])
     rate_a = A["n"] / union if union else NAN; rate_b = B["n"] / union if union else NAN
     md = mean(dsnr)
@@ -748,7 +747,10 @@ def render_html(R, nav="", refresh=0):
         row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}"),
         row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "packets the other node missed"),
         row("Average SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low means the other node ran out of sensitivity; high means collisions or timing"),
-        row("Weak packets decoded (SNR < −5 dB)", f"{weak_a:,}", f"{weak_b:,}", "sensitivity at the margin"),
+        row(f"Decoded below {signed(DEEP_DB)} dB SNR", f"{fa['deep']:,} <small>({fa['deep_pct']:.0f}%)</small>", f"{fb['deep']:,} <small>({fb['deep_pct']:.0f}%)</small>",
+            "deep in the noise, where sensitivity rather than luck decides"),
+        row("Weakest packet decoded", f"{fmt(fa['snr_min'],0,1)} dB <small>(5th pct {fmt(fa['snr_p5'],0,1)})</small>", f"{fmt(fb['snr_min'],0,1)} dB <small>(5th pct {fmt(fb['snr_p5'],0,1)})</small>",
+            "the node's practical sensitivity floor on this channel"),
         row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB"),
         row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio, see the RSSI scatter"),
         row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm", "node's own measurement"),
@@ -919,6 +921,19 @@ def write_html(R, path):
     print(f"wrote {path}")
 
 
+DEEP_DB = -8  # "deep" packets: decoded this far below the noise, where receiver sensitivity is what decides
+
+
+def floor_stats(n):
+    """Sensitivity floor of one node over every packet it decoded (matched and exclusive):
+    weakest SNR, 5th percentile, and how many were below DEEP_DB."""
+    vs = sorted(n["snr"] + [p["snr"] for p in n["only"]])
+    if not vs:
+        return {"snr_min": NAN, "snr_p5": NAN, "deep": 0, "deep_pct": NAN}
+    return {"snr_min": vs[0], "snr_p5": vs[len(vs) // 20], "deep": sum(1 for v in vs if v < DEEP_DB),
+            "deep_pct": 100 * sum(1 for v in vs if v < DEEP_DB) / len(vs)}
+
+
 def summary(R):
     """Compact JSON-able summary of a result (for the web app / scripting)."""
     A, B = R["A"], R["B"]
@@ -927,7 +942,7 @@ def summary(R):
                 "only_snr_avg": mean([p["snr"] for p in n["only"]]),
                 "snr_avg": mean(n["snr"]), "rssi_avg": mean(n["rssi"]),
                 "noise_avg": mean([v for _, v in n["noise"]]), "crc_errors": n["crc"],
-                "weak_heard": sum(1 for v in n["snr"] + [p["snr"] for p in n["only"]] if v < -5)}
+                **floor_stats(n)}
     d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]),
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),
