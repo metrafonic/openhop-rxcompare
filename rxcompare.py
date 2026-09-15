@@ -18,6 +18,8 @@ import argparse, csv, html, json, math, os, ssl, statistics as st, sys, time, ur
 from collections import Counter, defaultdict
 
 MATCH_WINDOW_S = 3.0   # both nodes hear the same transmission within this many seconds
+TYPE_NAMES = {0: "REQ", 1: "RESPONSE", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "GRP_TXT", 6: "GRP_DATA",
+              7: "ANON_REQ", 8: "PATH", 9: "TRACE", 10: "MULTIPART", 11: "CONTROL"}
 PAGE = 1000
 NAN = float("nan")
 
@@ -199,6 +201,44 @@ def analyze(A, B, hours):
     # packet type mix over everything either node heard
     types = Counter(p["type"] for p in pa) | Counter(q["type"] for q in only_b)
 
+    # sensitivity curves: given one node decoded a transmission at SNR s, did the other?
+    # binned by the reference node's own reading, so each curve is on that node's scale
+    LVL = 2
+    lvl = lambda v: max(-14, min(12, math.floor(v / LVL) * LVL))
+    curve = {"a_given_b": defaultdict(lambda: [0, 0]), "b_given_a": defaultdict(lambda: [0, 0])}  # bin -> [decoded, seen]
+    for p, q in pairs:
+        curve["b_given_a"][lvl(p["snr"])][0] += 1; curve["b_given_a"][lvl(p["snr"])][1] += 1
+        curve["a_given_b"][lvl(q["snr"])][0] += 1; curve["a_given_b"][lvl(q["snr"])][1] += 1
+    for p in only_a:
+        curve["b_given_a"][lvl(p["snr"])][1] += 1
+    for q in only_b:
+        curve["a_given_b"][lvl(q["snr"])][1] += 1
+    curves = {k: [{"snr": x, "decoded": v[0], "seen": v[1]} for x, v in sorted(c.items())] for k, c in curve.items()}
+
+    # SNR delta by signal level, keyed on the packet's mean reading so neither node's noise biases the bin
+    by_level = defaultdict(list)
+    for p, q in pairs:
+        by_level[lvl((p["snr"] + q["snr"]) / 2)].append(q["snr"] - p["snr"])
+    dsnr_by_level = [{"snr": x, "n": len(v), "mean": mean(v), "ci": 1.96 * st.pstdev(v) / math.sqrt(len(v)) if len(v) > 1 else NAN}
+                     for x, v in sorted(by_level.items())]
+
+    # decode rate per payload type (long packets collide more; short ones mostly test sensitivity)
+    tstat = defaultdict(lambda: {"both": 0, "a": 0, "b": 0, "len": []})
+    for p, q in pairs:
+        tstat[p["type"]]["both"] += 1; tstat[p["type"]]["len"].append(p["length"])
+    for p in only_a:
+        tstat[p["type"]]["a"] += 1; tstat[p["type"]]["len"].append(p["length"])
+    for q in only_b:
+        tstat[q["type"]]["b"] += 1; tstat[q["type"]]["len"].append(q["length"])
+    by_type = [{"type": t, "name": TYPE_NAMES.get(t, f"type {t}"), "both": v["both"], "a": v["a"], "b": v["b"],
+                "n": v["both"] + v["a"] + v["b"], "len": mean(v["len"])}
+               for t, v in sorted(tstat.items(), key=lambda kv: -(kv[1]["both"] + kv[1]["a"] + kv[1]["b"]))]
+
+    # match quality: clock offset between the nodes' timestamps and wild per-packet disagreements
+    dts = sorted(q["timestamp"] - p["timestamp"] for p, q in pairs)
+    clock = {"median": med(dts), "p5": dts[len(dts) // 20] if dts else NAN, "p95": dts[-max(1, len(dts) // 20)] if dts else NAN,
+             "max_abs": max(abs(d) for d in dts) if dts else NAN, "wild": sum(1 for d in dsnr if abs(d) > 10)}
+
     return {
         "generated": time.time(), "start": start, "end": end, "bucket": bucket,
         "A": {"name": A.name, "url": A.url, "n": len(pa), "only": only_a, "rssi": ra, "snr": sa,
@@ -206,7 +246,7 @@ def analyze(A, B, hours):
         "B": {"name": B.name, "url": B.url, "n": len(pb), "only": only_b, "rssi": rb, "snr": sb,
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
-        "types": types,
+        "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
     }
 
 
@@ -296,7 +336,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 .who .vs{font-size:16px;font-weight:400;color:var(--muted)}
 .ch{display:inline-block;font-size:11px;font-weight:700;line-height:1;color:#fff;padding:3px 5px 2px;border-radius:4px;vertical-align:.15em;margin-right:5px}.ch.a{background:var(--a)}.ch.b{background:var(--b)}
 .tile .v .ch{font-size:13px;padding:4px 6px 3px;vertical-align:.25em;margin:0 6px 0 0}.tile .v .ch.b{margin-left:14px}
-.meta{color:var(--ink2);max-width:72ch;margin:0 0 14px;line-height:1.5}
+.meta{color:var(--ink2);max-width:72ch;margin:0 0 14px;line-height:1.5}.meta.warn{color:var(--b)}
 .sub{color:var(--ink2);margin:0 0 20px;overflow-wrap:anywhere}.sub code{font-size:12px}
 .nav{display:flex;flex-wrap:wrap;gap:6px;margin:0}.nav a{color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:13px}.nav a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--ink2);font-size:13px;margin:0 0 12px}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
@@ -412,7 +452,8 @@ def esc(s):
 
 def signed(v, fmt="g"):
     """Signed number with a typographic minus, so −1 reads as clearly as +1 on an axis."""
-    return "0" if v == 0 else f"{v:+{fmt}}".replace("-", "−")
+    t = f"{v:+{fmt}}"
+    return t[1:] if not t.strip("+-0.") else t.replace("-", "−")
 
 
 def nice_ticks(lo, hi, n=5):
@@ -535,6 +576,94 @@ def chart_excl_neighbours(neigh, na, nb):
               f'only {esc(na)} {n["a"]}, only {esc(nb)} {n["b"]}, both {n["both"]}"/>')
         s.add(f'<text x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
         s.add(f'<text x="{s.ml-8-46}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
+    return s.render()
+
+
+def chart_decode_curve(curves, na, nb, step=2, min_n=5):
+    """Sensitivity curves: P(A decoded | B heard it at SNR s) in A's colour, and vice versa.
+    Each curve sits on the reference node's own SNR scale."""
+    series = [("a_given_b", "var(--a)", na, nb), ("b_given_a", "var(--b)", nb, na)]
+    pts = {k: [c for c in curves[k] if c["seen"] >= min_n] for k, *_ in series}
+    if not any(pts.values()):
+        return "<p>not enough packets yet</p>"
+    s = Svg(w=520, h=260, ml=44, mb=30)
+    s.scales(-14 - step / 2, 12 + step * 1.5, 0, 1.06)
+    s.axes(list(range(-14, 13, 4)), [0, .25, .5, .75, 1], xfmt=signed, yfmt=lambda t: f"{100*t:.0f}%")
+    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-2}" text-anchor="middle">SNR as read by the node that heard it, dB</text>')
+    for k, col, who, ref in series:
+        d, pen = [], False
+        for c in pts[k]:
+            x, y = s.x(c["snr"] + step / 2), s.y(c["decoded"] / c["seen"])
+            d.append(f'{"L" if pen else "M"}{x:.1f},{y:.1f}'); pen = True
+        s.add(f'<path fill="none" stroke="{col}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" d="{"".join(d)}"/>')
+    # one hit column per bin with both nodes' figures
+    bins = sorted({c["snr"] for k in pts for c in pts[k]})
+    half = (s.x(step) - s.x(0)) / 2
+    for x in bins:
+        tip = [f"{signed(x)}…{signed(x + step)} dB"]
+        for k, col, who, ref in series:
+            c = next((c for c in pts[k] if c["snr"] == x), None)
+            if c:
+                tip.append(f"heard by {ref} at that level: {c['seen']} · {who} also decoded {c['decoded']} ({100*c['decoded']/c['seen']:.0f}%)")
+        cx = s.x(x + step / 2)
+        s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" data-tip="{esc(chr(10).join(tip))}"/>')
+        for k, col, who, ref in series:
+            c = next((c for c in pts[k] if c["snr"] == x), None)
+            if c:
+                s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{s.y(c["decoded"]/c["seen"]):.1f}" r="{3 + min(2, math.log10(c["seen"])):.1f}" fill="{col}" '
+                      f'stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
+    return s.render()
+
+
+def chart_delta_by_level(rows, na, nb, step=2, min_n=5):
+    """Mean Δ SNR (B−A) with 95% CI whiskers, per 2 dB of signal level. Flat = a calibration offset;
+    a slope or a kink near the floor = the radios really differ there."""
+    rows = [r for r in rows if r["n"] >= min_n]
+    if not rows:
+        return "<p>not enough matched packets yet</p>"
+    ext = max(abs(r["mean"]) + (r["ci"] if r["ci"] == r["ci"] else 0) for r in rows)
+    lim = max(2.0, math.ceil(ext * 2) / 2)
+    s = Svg(w=520, h=260, ml=44, mb=30)
+    s.scales(-14 - step / 2, 12 + step * 1.5, -lim, lim)
+    s.axes(list(range(-14, 13, 4)), nice_ticks(-lim, lim, 5), xfmt=signed, yfmt=lambda t: f"{signed(t)}", y0=True)
+    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-2}" text-anchor="middle">mean of the two SNR readings, dB</text>')
+    s.add(f'<text class="lbl" x="{s.ml+4}" y="{s.mt+11}" fill="var(--b)">{esc(nb)} cleaner ↑</text>'
+          f'<text class="lbl" x="{s.ml+4}" y="{s.h-s.mb-5}" fill="var(--a)">{esc(na)} cleaner ↓</text>')
+    d = "".join(f'{"L" if i else "M"}{s.x(r["snr"] + step / 2):.1f},{s.y(r["mean"]):.1f}' for i, r in enumerate(rows))
+    s.add(f'<path fill="none" stroke="var(--axis)" stroke-width="1.5" d="{d}"/>')
+    half = (s.x(step) - s.x(0)) / 2
+    for r in rows:
+        cx = s.x(r["snr"] + step / 2); cy = s.y(r["mean"])
+        col = "var(--b)" if r["mean"] > 0 else "var(--a)"
+        ci = f" ± {r['ci']:.2f}" if r["ci"] == r["ci"] else ""
+        s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" '
+              f'data-tip="{signed(r["snr"])}…{signed(r["snr"] + step)} dB: {r["n"]} packets\nΔ SNR {signed(r["mean"], ".2f")}{ci} dB"/>')
+        if r["ci"] == r["ci"]:
+            s.add(f'<line x1="{cx:.1f}" x2="{cx:.1f}" y1="{s.y(r["mean"]-r["ci"]):.1f}" y2="{s.y(r["mean"]+r["ci"]):.1f}" stroke="{col}" stroke-width="1.5" pointer-events="none"/>')
+        s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
+    return s.render()
+
+
+def chart_type_rates(by_type, na, nb, min_n=10):
+    """Decode rate per payload type, one row per type, A above B. Long packets are exposed to
+    collisions for longer, so a gap that opens only on long types is timing, not sensitivity."""
+    rows = [t for t in by_type if t["n"] >= min_n][:8]
+    if not rows:
+        return "<p>not enough packets yet</p>"
+    rh = 26
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=118, mr=16, mt=8, mb=26)
+    s.scales(0, 1.0, 0, len(rows))
+    s.axes([0, .25, .5, .75, 1], [], xfmt=lambda t: f"{100*t:.0f}%", y0=False)
+    for i, t in enumerate(rows):
+        y = s.mt + i * rh + 3
+        ra, rb = (t["both"] + t["a"]) / t["n"], (t["both"] + t["b"]) / t["n"]
+        for j, (v, col) in enumerate(((ra, "var(--a)"), (rb, "var(--b)"))):
+            w = max(1, s.x(v) - s.x(0)); r = min(3, w)
+            s.add(f'<path class="mark" fill="{col}" d="M{s.x(0):.1f},{y + j*10}h{w-r:.1f}q{r},0 {r},{r}v{8-2*r}q0,{r} -{r},{r}h-{w-r:.1f}Z"/>')
+        s.add(f'<rect class="hit" x="{s.ml}" y="{y-3}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="{esc(t["name"])} · {t["n"]} transmissions, avg {t["len"]:.0f} B\n'
+              f'{esc(na)} decoded {t["both"]+t["a"]} ({100*ra:.0f}%)\n{esc(nb)} decoded {t["both"]+t["b"]} ({100*rb:.0f}%)"/>')
+        s.add(f'<text x="{s.ml-8}" y="{y+13}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(t["name"])}</text>')
+        s.add(f'<text x="{s.ml-8-66}" y="{y+13}" text-anchor="end" fill="var(--muted)" font-size="10">{t["len"]:.0f} B</text>')
     return s.render()
 
 
@@ -726,6 +855,9 @@ def render_html(R, nav="", refresh=0):
     lead = nb if md > 0 else na
     ties = npair - better_a - better_b
     oa, ob = len(A["only"]), len(B["only"])
+    # the gap is paired (every transmission is a yes/no on each node), so its CI comes from the per-transmission difference
+    gap = (ob - oa) / union if union else NAN
+    gap_ci = 1.96 * math.sqrt(max(0.0, (oa + ob) / union - gap * gap) / union) if union else NAN
     rate_bar = segbar([(oa / union, "a", f"A only {100*oa/union:.0f}%"), (npair / union, "n", f"both {100*npair/union:.0f}%"), (ob / union, "b", f"B only {100*ob/union:.0f}%")],
                       tip=f"only {na}: {oa:,} ({100*oa/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {nb}: {ob:,} ({100*ob/union:.1f}%)") if union else ""
     snr_bar = segbar([(better_a / npair, "a", f"A {100*better_a/npair:.0f}%"), (ties / npair, "n", f"tie {100*ties/npair:.0f}%"), (better_b / npair, "b", f"B {100*better_b/npair:.0f}%")],
@@ -735,7 +867,7 @@ def render_html(R, nav="", refresh=0):
              f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
         tile("Decode rate of all transmissions seen",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             f"{rate_bar}{union:,} distinct transmissions, {npair:,} of them heard by both."),
+             f"{rate_bar}{union:,} distinct transmissions, {npair:,} heard by both. Gap (B − A) {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts." if union else ""),
         tile("Better SNR on the same packet",
              f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
              f"{snr_bar}{npair:,} matched packets; a tie is an identical SNR reading." if npair else ""),
@@ -767,6 +899,11 @@ def render_html(R, nav="", refresh=0):
     partial = f"Last bucket is {100*bk[-1].get('frac', 1):.0f}% elapsed and scaled to a full-bucket rate." if bk and bk[-1].get("frac", 1) < 1 else ""
     cnt_chart = chart_lines([(na, "var(--a)", [b["a"] for b in bk]), (nb, "var(--b)", [b["b"] for b in bk])], ts,
                             yfmt=lambda v: f"{v:g}", zero=True)
+    def brate(b, k):
+        u = b["a"] + b["b"] - b["both"]
+        return b[k] / u if u else NAN
+    rate_chart = chart_lines([(na, "var(--a)", [brate(b, "a") for b in bk]), (nb, "var(--b)", [brate(b, "b") for b in bk])], ts,
+                             yfmt=lambda v: f"{100*v:.0f}%")
     dsnr_chart = chart_lines([("Δ SNR (B−A)", "var(--ink2)", [b["dsnr"] for b in bk])], ts,
                              yfmt=lambda v: f"{v:+.2f}", zero=True)
 
@@ -818,12 +955,16 @@ def render_html(R, nav="", refresh=0):
             dcell = f'{n["dsnr"]:+.2f} {bar}'
         else:
             dcell = "–"
-        nrows.append(f"<tr data-hop=\"{esc(n['hop'])}\" class=\"pick\"><td>{esc(n['hop'])}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>"
+        u = n["both"] + n["a"] + n["b"]
+        ha, hb = (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
+        hcell = lambda v, w, col: f'<td style="color:var(--{col})">{100*v:.0f}%</td>' if v - w >= 0.005 else f"<td>{100*v:.0f}%</td>"
+        nrows.append(f"<tr data-hop=\"{esc(n['hop'])}\" class=\"pick\"><td>{esc(n['hop'])}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>{hcell(ha, hb, 'a')}{hcell(hb, ha, 'b')}"
                      f"<td>{fmt(n['rssi_a'],0,1)}</td><td>{fmt(n['rssi_b'],0,1)}</td><td>{fmt(n['drssi'],0,1)}</td>"
                      f"<td>{fmt(n['snr_a'],0,2)}</td><td>{fmt(n['snr_b'],0,2)}</td><td>{dcell}</td></tr>")
 
     # ---- bucket table (table view for the time charts)
     brows = "".join(f"<tr><td>{tlabel(b['t'])}</td><td>{b['a']}</td><td>{b['b']}</td><td>{b['both']}</td>"
+                    f"<td>{fmt(100*brate(b,'a'),0,0)}%</td><td>{fmt(100*brate(b,'b'),0,0)}%</td>"
                     f"<td>{fmt(b['drssi'],0,2)}</td><td>{fmt(b['dsnr'],0,2)}</td></tr>" for b in bk)
 
     # ---- matched pairs table (collapsed)
@@ -831,6 +972,17 @@ def render_html(R, nav="", refresh=0):
                    f"<td>{p['type']}</td><td>{p['length']}</td><td>{p['rssi']}</td><td>{q['rssi']}</td><td>{q['rssi']-p['rssi']:+d}</td>"
                    f"<td>{p['snr']:.2f}</td><td>{q['snr']:.2f}</td><td>{q['snr']-p['snr']:+.2f}</td></tr>"
                    for p, q in sorted(pairs, key=lambda pq: -pq[0]["timestamp"]))
+
+    # ---- match quality
+    ck = R["clock"]
+    if npair:
+        tight = abs(ck["p95"]) < 0.5 * MATCH_WINDOW_S and abs(ck["p5"]) < 0.5 * MATCH_WINDOW_S
+        clock_note = (f'<p class="meta{"" if tight else " warn"}">Clocks: {esc(nb)} stamps the same packet {signed(ck["median"], ".2f")} s relative to {esc(na)} '
+                      f'(5th–95th pct {signed(ck["p5"], ".2f")}…{signed(ck["p95"], ".2f")} s, max |Δt| {ck["max_abs"]:.2f} s against a {MATCH_WINDOW_S:g} s window'
+                      + ("" if tight else " — close to the window; drift would turn matches into exclusives") + f'). '
+                      f'{ck["wild"]} pair{"s" if ck["wild"] != 1 else ""} ({100*ck["wild"]/npair:.1f}%) differ by more than 10 dB, usually a collision at one node.</p>')
+    else:
+        clock_note = ""
 
     only_a_snr = [p["snr"] for p in A["only"]]; only_b_snr = [p["snr"] for p in B["only"]]
     meta = [hopname(p) for p, _ in pairs]
@@ -841,7 +993,7 @@ def render_html(R, nav="", refresh=0):
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
 A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
 Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
-<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#matched">Matched</a><a href="#missed">Missed</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
+<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#matched">Matched</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
 <section id="overview" class="first">
 <div class="top">{"".join(tiles)}</div>
@@ -852,6 +1004,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <section id="matched">
 <h2>The same transmission, heard by both</h2>
 <p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
+{clock_note}
 <div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
 <div class="card"><h3>Δ SNR per packet, B − A</h3><p>Left of zero: {esc(na)} decoded the packet cleaner; right of zero: {esc(nb)} did. Bars are coloured by the winning node.</p>{chart_hist(dsnr, -8, 8, 1, '', h=360, marker=(md, f'mean {signed(md, ".2f")}'), sides=(na, nb))}</div>
@@ -864,6 +1017,16 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <div class="grid2">
 <div class="card"><h3>How weak were they</h3><p>SNR of packets the other node missed. Misses on the left are the other node running out of sensitivity; misses on the right are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
 <div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
+</div>
+</section>
+
+<section id="sensitivity">
+<h2>Sensitivity or collisions?</h2>
+<p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air.</p>
+<div class="grid2">
+<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Each curve is on the reference node's own SNR scale. The cliff is the sensitivity floor.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
+<div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>
 </section>
 
@@ -890,6 +1053,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <p class="meta">Both nodes, all neighbours, in {R['bucket']//60}-minute buckets.</p>
 <div class="grid2">
 <div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together. {partial}</p>{leg}{cnt_chart}</div>
+<div class="card"><h3>Decode rate per {R['bucket']//60} min</h3><p>Each node's share of the transmissions at least one of them decoded in that bucket. Shows whether the gap is steady or comes with traffic bursts or noise.</p>{leg}{rate_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
 <div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
 <div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise. {partial}</p>{leg}{crc_chart}</div>
@@ -905,10 +1069,10 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <div class="card"><h3>Δ RSSI per packet, B − A</h3><p>A bimodal shape here is a calibration artefact, not antenna gain. Mean {mean(drssi):+.2f} dB.</p>{chart_hist(drssi, -10, 10, 1, '', h=360)}</div>
 </div></details>
 <details open><summary>Per-neighbour table ({len(R['neighbours'])} rows)</summary>
-<div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
+<div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th><th>heard by {esc(na)}</th><th>heard by {esc(nb)}</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ RSSI</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ SNR (B−A)</th></tr></thead>
 <tbody>{"".join(nrows)}</tbody></table></div></details>
-<details><summary>Per-bucket table ({len(bk)} rows)</summary><div class="card wrap"><table><thead><tr><th>bucket</th><th>{esc(na)}</th><th>{esc(nb)}</th><th>both</th><th>Δ RSSI</th><th>Δ SNR</th></tr></thead><tbody>{brows}</tbody></table></div></details>
+<details><summary>Per-bucket table ({len(bk)} rows)</summary><div class="card wrap"><table><thead><tr><th>bucket</th><th>{esc(na)}</th><th>{esc(nb)}</th><th>both</th><th>rate {esc(na)}</th><th>rate {esc(nb)}</th><th>Δ RSSI</th><th>Δ SNR</th></tr></thead><tbody>{brows}</tbody></table></div></details>
 <details><summary>All matched packets ({npair} rows)</summary><div class="card wrap"><table><thead><tr><th>time</th><th>hop</th><th>type</th><th>len</th>
 <th>RSSI {esc(na)}</th><th>RSSI {esc(nb)}</th><th>Δ</th><th>SNR {esc(na)}</th><th>SNR {esc(nb)}</th><th>Δ</th></tr></thead><tbody>{prow}</tbody></table></div></details>
 </section>
@@ -939,12 +1103,15 @@ def summary(R):
     """Compact JSON-able summary of a result (for the web app / scripting)."""
     A, B = R["A"], R["B"]
     def side(n):
-        return {"name": n["name"], "packets": n["n"], "only": len(n["only"]),
+        u = len(R["pairs"]) + len(A["only"]) + len(B["only"])
+        return {"name": n["name"], "packets": n["n"], "only": len(n["only"]), "decode_rate": n["n"] / u if u else NAN,
                 "only_snr_avg": mean([p["snr"] for p in n["only"]]),
                 "snr_avg": mean(n["snr"]), "rssi_avg": mean(n["rssi"]),
                 "noise_avg": mean([v for _, v in n["noise"]]), "crc_errors": n["crc"],
                 **floor_stats(n)}
-    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]),
+    union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
+    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
+         "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),
                              "rssi_mean": mean(R["drssi"]), "rssi_median": med(R["drssi"]),

@@ -14,6 +14,11 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
   time (the fair metric — RSSI is calibrated differently per radio and is shown but flagged as such)
 - packets **only one node** decoded: how weak they were (sensitivity vs. collisions) and
   which neighbours each node misses
+- **sensitivity or collisions**: the chance the other node also decoded a packet, by SNR
+  (each node's real floor), the SNR offset by signal level (calibration vs. genuine), and
+  decode rate by packet type (long packets collide more)
+- **decode rate over time** and a match-quality check (clock offset between the nodes,
+  pairs that disagree wildly)
 - **per neighbour**: SNR on each node side by side, so threshold-level neighbours stand out
 - noise floor and CRC errors per node, over the same window
 - an interactive **neighbour explorer**: pick a hop and see every one of its packets over the
