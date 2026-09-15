@@ -18,6 +18,7 @@ import argparse, csv, html, json, math, os, ssl, statistics as st, sys, time, ur
 from collections import Counter, defaultdict
 
 MATCH_WINDOW_S = 3.0   # both nodes hear the same transmission within this many seconds
+DEEP_DB = -8   # "deep" packets: decoded this far below the noise, where receiver sensitivity is what decides
 TYPE_NAMES = {0: "REQ", 1: "RESPONSE", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "GRP_TXT", 6: "GRP_DATA",
               7: "ANON_REQ", 8: "PATH", 9: "TRACE", 10: "MULTIPART", 11: "CONTROL"}
 PAGE = 1000
@@ -175,18 +176,19 @@ def analyze(A, B, hours):
     bucket = 300 if span <= 2 * 3600 else 900 if span <= 12 * 3600 else 3600
     t0 = start - start % bucket
     nbk = int((end - t0) // bucket) + 1
-    buckets = [{"t": t0 + i * bucket, "a": 0, "b": 0, "both": 0, "dsnr": [], "drssi": []} for i in range(nbk)]
+    buckets = [{"t": t0 + i * bucket, "a": 0, "b": 0, "both": 0, "deep_a": 0, "deep_b": 0, "dsnr": [], "drssi": []} for i in range(nbk)]
 
     def bi(ts):
         return min(nbk - 1, max(0, int((ts - t0) // bucket)))
     for p, q in pairs:
         b = buckets[bi(p["timestamp"])]
         b["both"] += 1; b["a"] += 1; b["b"] += 1
+        b["deep_a"] += p["snr"] < DEEP_DB; b["deep_b"] += q["snr"] < DEEP_DB
         b["dsnr"].append(q["snr"] - p["snr"]); b["drssi"].append(q["rssi"] - p["rssi"])
     for p in only_a:
-        buckets[bi(p["timestamp"])]["a"] += 1
+        b = buckets[bi(p["timestamp"])]; b["a"] += 1; b["deep_a"] += p["snr"] < DEEP_DB
     for q in only_b:
-        buckets[bi(q["timestamp"])]["b"] += 1
+        b = buckets[bi(q["timestamp"])]; b["b"] += 1; b["deep_b"] += q["snr"] < DEEP_DB
     for b in buckets:
         b["dsnr"] = mean(b["dsnr"]); b["drssi"] = mean(b["drssi"])
     # the last bucket is only partly elapsed: scale its counts to a full-bucket rate so the line doesn't dip
@@ -195,7 +197,7 @@ def analyze(A, B, hours):
     if last["frac"] < 0.15 and len(buckets) > 1:
         buckets.pop()
     elif last["frac"] < 1.0:
-        for k in ("a", "b", "both"):
+        for k in ("a", "b", "both", "deep_a", "deep_b"):
             last[k] = round(last[k] / last["frac"], 1)
 
     # packet type mix over everything either node heard
@@ -586,10 +588,18 @@ def chart_decode_curve(curves, na, nb, step=2, min_n=5):
     pts = {k: [c for c in curves[k] if c["seen"] >= min_n] for k, *_ in series}
     if not any(pts.values()):
         return "<p>not enough packets yet</p>"
-    s = Svg(w=520, h=260, ml=44, mb=30)
+    s = Svg(w=520, h=270, ml=44, mb=40)
     s.scales(-14 - step / 2, 12 + step * 1.5, 0, 1.06)
-    s.axes(list(range(-14, 13, 4)), [0, .25, .5, .75, 1], xfmt=signed, yfmt=lambda t: f"{100*t:.0f}%")
-    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-2}" text-anchor="middle">SNR as read by the node that heard it, dB</text>')
+    s.axes(list(range(-14, 13, 4)), [0, .25, .5, .75, 1], xfmt=lambda t: ("≤" if t == -14 else "") + signed(t), yfmt=lambda t: f"{100*t:.0f}%")
+    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-4}" text-anchor="middle">SNR as read by the node that heard it, dB</text>')
+    # sample size per bin as a faint bar behind the curves, so a point on 8 packets doesn't read like one on 800
+    mxn = max(c["seen"] for k in pts for c in pts[k]) or 1
+    bw = (s.x(step) - s.x(0)) - 3
+    for k, col, who, ref in series:
+        for i, c in enumerate(pts[k]):
+            x = s.x(c["snr"] + step / 2) - bw / 2 + (bw / 2 if k == "b_given_a" else 0)
+            top = s.y(0.35 * c["seen"] / mxn)
+            s.add(f'<rect x="{x:.1f}" y="{top:.1f}" width="{bw/2:.1f}" height="{s.y(0)-top:.1f}" fill="{col}" fill-opacity=".14" pointer-events="none"/>')
     for k, col, who, ref in series:
         d, pen = [], False
         for c in pts[k]:
@@ -604,7 +614,7 @@ def chart_decode_curve(curves, na, nb, step=2, min_n=5):
         for k, col, who, ref in series:
             c = next((c for c in pts[k] if c["snr"] == x), None)
             if c:
-                tip.append(f"heard by {ref} at that level: {c['seen']} · {who} also decoded {c['decoded']} ({100*c['decoded']/c['seen']:.0f}%)")
+                tip.append(f"{ref} heard {c['seen']} at that level · {who} also decoded {c['decoded']} ({100*c['decoded']/c['seen']:.0f}%)")
         cx = s.x(x + step / 2)
         s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" data-tip="{esc(chr(10).join(tip))}"/>')
         for k, col, who, ref in series:
@@ -623,10 +633,10 @@ def chart_delta_by_level(rows, na, nb, step=2, min_n=5):
         return "<p>not enough matched packets yet</p>"
     ext = max(abs(r["mean"]) + (r["ci"] if r["ci"] == r["ci"] else 0) for r in rows)
     lim = max(2.0, math.ceil(ext * 2) / 2)
-    s = Svg(w=520, h=260, ml=44, mb=30)
+    s = Svg(w=520, h=270, ml=44, mb=40)
     s.scales(-14 - step / 2, 12 + step * 1.5, -lim, lim)
-    s.axes(list(range(-14, 13, 4)), nice_ticks(-lim, lim, 5), xfmt=signed, yfmt=lambda t: f"{signed(t)}", y0=True)
-    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-2}" text-anchor="middle">mean of the two SNR readings, dB</text>')
+    s.axes(list(range(-14, 13, 4)), nice_ticks(-lim, lim, 5), xfmt=lambda t: ("≤" if t == -14 else "") + signed(t), yfmt=lambda t: f"{signed(t)}", y0=True)
+    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-4}" text-anchor="middle">mean of the two SNR readings, dB</text>')
     s.add(f'<text class="lbl" x="{s.ml+4}" y="{s.mt+11}" fill="var(--b)">{esc(nb)} cleaner ↑</text>'
           f'<text class="lbl" x="{s.ml+4}" y="{s.h-s.mb-5}" fill="var(--a)">{esc(na)} cleaner ↓</text>')
     d = "".join(f'{"L" if i else "M"}{s.x(r["snr"] + step / 2):.1f},{s.y(r["mean"]):.1f}' for i, r in enumerate(rows))
@@ -639,7 +649,8 @@ def chart_delta_by_level(rows, na, nb, step=2, min_n=5):
         s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" '
               f'data-tip="{signed(r["snr"])}…{signed(r["snr"] + step)} dB: {r["n"]} packets\nΔ SNR {signed(r["mean"], ".2f")}{ci} dB"/>')
         if r["ci"] == r["ci"]:
-            s.add(f'<line x1="{cx:.1f}" x2="{cx:.1f}" y1="{s.y(r["mean"]-r["ci"]):.1f}" y2="{s.y(r["mean"]+r["ci"]):.1f}" stroke="{col}" stroke-width="1.5" pointer-events="none"/>')
+            y1, y2 = s.y(r["mean"] - r["ci"]), s.y(r["mean"] + r["ci"])
+            s.add(f'<path d="M{cx:.1f},{y1:.1f}V{y2:.1f}M{cx-3:.1f},{y1:.1f}h6M{cx-3:.1f},{y2:.1f}h6" stroke="{col}" stroke-width="1.5" fill="none" pointer-events="none"/>')
         s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
     return s.render()
 
@@ -651,7 +662,7 @@ def chart_type_rates(by_type, na, nb, min_n=10):
     if not rows:
         return "<p>not enough packets yet</p>"
     rh = 26
-    s = Svg(w=520, h=rh * len(rows) + 40, ml=118, mr=16, mt=8, mb=26)
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=118, mr=96, mt=8, mb=26)
     s.scales(0, 1.0, 0, len(rows))
     s.axes([0, .25, .5, .75, 1], [], xfmt=lambda t: f"{100*t:.0f}%", y0=False)
     for i, t in enumerate(rows):
@@ -664,6 +675,10 @@ def chart_type_rates(by_type, na, nb, min_n=10):
               f'{esc(na)} decoded {t["both"]+t["a"]} ({100*ra:.0f}%)\n{esc(nb)} decoded {t["both"]+t["b"]} ({100*rb:.0f}%)"/>')
         s.add(f'<text x="{s.ml-8}" y="{y+13}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(t["name"])}</text>')
         s.add(f'<text x="{s.ml-8-66}" y="{y+13}" text-anchor="end" fill="var(--muted)" font-size="10">{t["len"]:.0f} B</text>')
+        gap = rb - ra
+        s.add(f'<text x="{s.w-s.mr+8}" y="{y+13}" fill="var(--ink2)" font-size="11" font-variant-numeric="tabular-nums">'
+              f'<tspan fill="var(--a)">{100*ra:.0f}</tspan><tspan fill="var(--muted)"> / </tspan><tspan fill="var(--b)">{100*rb:.0f}</tspan>'
+              f'<tspan fill="var(--muted)" font-size="10" dx="6">{signed(100*gap, ".0f")}</tspan></text>')
     return s.render()
 
 
@@ -904,6 +919,8 @@ def render_html(R, nav="", refresh=0):
         return b[k] / u if u else NAN
     rate_chart = chart_lines([(na, "var(--a)", [brate(b, "a") for b in bk]), (nb, "var(--b)", [brate(b, "b") for b in bk])], ts,
                              yfmt=lambda v: f"{100*v:.0f}%")
+    deep_chart = chart_lines([(na, "var(--a)", [b["deep_a"] for b in bk]), (nb, "var(--b)", [b["deep_b"] for b in bk])], ts,
+                             yfmt=lambda v: f"{v:g}", zero=True)
     dsnr_chart = chart_lines([("Δ SNR (B−A)", "var(--ink2)", [b["dsnr"] for b in bk])], ts,
                              yfmt=lambda v: f"{v:+.2f}", zero=True)
 
@@ -1056,6 +1073,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <div class="card"><h3>Decode rate per {R['bucket']//60} min</h3><p>Each node's share of the transmissions at least one of them decoded in that bucket. Shows whether the gap is steady or comes with traffic bursts or noise.</p>{leg}{rate_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
 <div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
+<div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min</h3><p>The floor stat over time. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
 <div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise. {partial}</p>{leg}{crc_chart}</div>
 </div>
 </section>
@@ -1084,9 +1102,6 @@ def write_html(R, path):
     with open(path, "w") as f:
         f.write(render_html(R))
     print(f"wrote {path}")
-
-
-DEEP_DB = -8  # "deep" packets: decoded this far below the noise, where receiver sensitivity is what decides
 
 
 def floor_stats(n):
