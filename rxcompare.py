@@ -553,7 +553,8 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600
 .geo-dot{display:block;border-radius:50%}#geo-tbl .sw{margin-left:4px;margin-right:10px}
 #geo .legend .line{display:inline-block;width:22px;height:0;border-top:2px solid var(--muted);opacity:.45;margin-right:6px;vertical-align:3px}
 #geo-radar svg{overflow:visible}.lbl.hop{font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--surface);stroke-width:3px;stroke-linejoin:round}.ring{fill:none;stroke:var(--grid)}.ring.major{stroke:var(--axis)}.spoke{stroke:var(--grid)}.compass{fill:var(--ink2);font-size:12px;font-weight:600}
-#geo-map{width:100%;aspect-ratio:1;min-height:320px;border-radius:6px;overflow:hidden;background:var(--plane);border:1px solid var(--grid);position:relative}
+#geo-map{width:100%;aspect-ratio:1;min-height:320px;border-radius:6px;overflow:hidden;background:var(--plane);border:1px solid var(--grid);position:relative;isolation:isolate;z-index:0}   /* Leaflet's pane z-indexes stay inside, under the sticky topbar */
+#geo-map:focus{outline:2px solid var(--a);outline-offset:0}
 #geo-map .geo-load{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--ink2);font-size:13px;text-align:center;padding:16px}
 #geo-map.leaflet-container{font:inherit;background:var(--plane)}
 /* tiles are desaturated so the only colour on the map is the data; MAP_GRAY=0 keeps the tiles' own colours */
