@@ -370,10 +370,10 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
-.tile .v.hero{font-size:38px}.tile .sub{font-size:20px;font-weight:600;line-height:1.2;margin:10px 0 2px;color:var(--ink)}.tile .sub .ch{font-size:12px;padding:3px 5px 2px;vertical-align:.3em;margin:0 5px 0 0}.tile .sub .ch.b{margin-left:10px}.tile .sub .k{font-size:12px;font-weight:400;color:var(--ink2);margin-left:6px}.tile .d>div{margin-top:4px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
+.tile .v.hero{font-size:38px}.halves{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:18px;margin-top:6px}.half .h{font-size:12.5px;font-weight:600;color:var(--ink);margin-bottom:2px}.half .v{font-size:30px}.half .verdict{font-size:14px;margin-top:8px;color:var(--ink)}.half .verdict .k{color:var(--ink2);font-size:12px;font-weight:400}.half .note{font-size:11.5px;color:var(--ink2);margin-top:2px}.tile .sub{font-size:20px;font-weight:600;line-height:1.2;margin:10px 0 2px;color:var(--ink)}.tile .sub .ch{font-size:12px;padding:3px 5px 2px;vertical-align:.3em;margin:0 5px 0 0}.tile .sub .ch.b{margin-left:10px}.tile .sub .k{font-size:12px;font-weight:400;color:var(--ink2);margin-left:6px}.tile .d>div{margin-top:4px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
-.top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
+.top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:2fr 1fr 1fr}}
 .sbar{margin:8px 0 4px}.sbar .bar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.sbar .bar i{display:block;height:100%}.sbar .a{background:var(--a)}.sbar .b{background:var(--b)}.sbar .n{background:var(--axis)}
 .sbar .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.sbar .seg span{text-align:center;overflow:hidden}.sbar .seg span.l{text-align:left;overflow:visible}.sbar .seg span.r{text-align:right;overflow:visible;direction:rtl}
 
@@ -967,36 +967,33 @@ def render_html(R, nav="", refresh=0):
                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
     reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
-    lead_d = (nb if gap > 0 else na) if union else ""
-    ex_bar = segbar([(sh["only_a"] / ex_union, "a", f"A only {100*sh['only_a']/ex_union:.0f}%"), (sh["pairs"] / ex_union, "n", f"both {100*sh['pairs']/ex_union:.0f}%"),
-                     (sh["only_b"] / ex_union, "b", f"B only {100*sh['only_b']/ex_union:.0f}%")],
-                    tip=f"shared neighbours only ({ex_union:,} transmissions)\nonly {na}: {sh['only_a']:,}\nboth: {sh['pairs']:,}\nonly {nb}: {sh['only_b']:,}") if one_sided and ex_union else ""
-    if union and abs(gap) > gap_ci:
-        head = f"<b>{esc(lead_d)} decodes {100*abs(gap):.1f} pts more</b> (±{100*gap_ci:.1f}) of {union:,} transmissions at these positions."
-    elif union:
-        head = f"Level within noise: gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts over {union:,} transmissions."
-    else:
-        head = ""
-    if one_sided:
-        ex_lead = nb if ex_gap > 0 else na
-        ex_head = (f"<b>{esc(ex_lead)} by {100*abs(ex_gap):.1f} pts</b>" if abs(ex_gap) > gap_ci else "<b>level</b>") + \
-                  f" on the {len(R['neighbours']) - len(one_sided)} neighbours both positions hear; {', '.join(esc(h) for h in R['one_sided'])} left out."
-        sub = (f'<div class="sub"><span class="ch a">A</span>{100*ex_rate_a:.1f}%<span class="ch b">B</span>{100*ex_rate_b:.1f}% '
-               f'<span class="k">shared neighbours only</span></div>{ex_bar}<div>{ex_head}</div>')
-    else:
-        sub = ""
+    # hero: two panels side by side, same size — everything at these positions, and shared neighbours only
+    def panel(title, ra_, rb_, bar, verdict, note):
+        return (f'<div class="half"><div class="h">{title}</div>'
+                f'<div class="v"><span class="ch a">A</span>{100*ra_:.1f}%<span class="ch b">B</span>{100*rb_:.1f}%</div>{bar}'
+                f'<div class="verdict">{verdict}</div><div class="note">{note}</div></div>')
+    def verdict(g, ci_, n_lead):
+        return f"<b>{esc(n_lead)} +{100*abs(g):.1f} pts</b> <span class=\"k\">±{100*ci_:.1f}</span>" if abs(g) > ci_ else f"<b>Level</b> <span class=\"k\">gap {signed(100*g, '.1f')} ±{100*ci_:.1f}</span>"
+    panels = ""
+    if union:
+        panels += panel("All neighbours, at these positions", rate_a, rate_b, rate_bar, verdict(gap, gap_ci, nb if gap > 0 else na),
+                        f"{union:,} transmissions")
+    if one_sided and ex_union:
+        ex_bar = segbar([(sh["only_a"] / ex_union, "a", f"A only {100*sh['only_a']/ex_union:.0f}%"), (sh["pairs"] / ex_union, "n", f"both {100*sh['pairs']/ex_union:.0f}%"),
+                         (sh["only_b"] / ex_union, "b", f"B only {100*sh['only_b']/ex_union:.0f}%")],
+                        tip=f"shared neighbours only ({ex_union:,} transmissions)\nonly {na}: {sh['only_a']:,}\nboth: {sh['pairs']:,}\nonly {nb}: {sh['only_b']:,}")
+        panels += panel("Shared neighbours only", ex_rate_a, ex_rate_b, ex_bar, verdict(ex_gap, gap_ci, nb if ex_gap > 0 else na),
+                        f"{ex_union:,} transmissions · without ◐ {', '.join(esc(h) for h in R['one_sided'])}")
     tiles = [
-        tile("Decoded, of every transmission on the air",
-             f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             f"{rate_bar}<div>{head}</div>{sub}" if union else "", hero=True),
+        f'<div class="tile hero"><div class="l">Share of transmissions decoded</div><div class="halves">{panels}</div></div>' if union else tile("Share of transmissions decoded", "–"),
         tile("SNR on the same packet, B − A", f"{signed(md, '.2f')} dB" if npair else "–",
-             f"{esc(lead)} reads cleaner on {100*max(better_a, better_b)/npair:.0f}% of {npair:,} shared packets; 95% CI ±{ci:.2f}, median {signed(med(dsnr), '.2f')} dB. "
-             f"A reading offset between the radios as much as a receive difference — diagnostic, not the outcome." if npair else ""),
+             f"<b>{esc(lead)} reads higher</b> on {100*max(better_a, better_b)/npair:.0f}% of {npair:,} shared packets (CI ±{ci:.2f}). "
+             f"Largely a reporting offset between the radios — diagnostic, not the outcome." if npair else ""),
         tile(f"Decoded below {signed(DEEP_DB)} dB SNR",
              f"<span class=\"ch a\">A</span>{fa['deep']:,}<span class=\"ch b\">B</span>{fb['deep']:,}",
-             (f"{fa['deep_pct']:.0f}% / {fb['deep_pct']:.0f}% of each node's packets; floor (5th pct) {signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB. "
-              + (f"Shared neighbours only: {ex_deep_a:,} / {ex_deep_b:,}. " if one_sided else "")
-              + f"Readings on a common scale (the {signed(md, '.2f')} dB offset split between the nodes). Where the front end decides.")),
+             (f"<b>{fa['deep_pct']:.0f}% / {fb['deep_pct']:.0f}%</b> of each node's packets"
+              + (f" · shared neighbours only <b>{ex_deep_a:,} / {ex_deep_b:,}</b>" if one_sided else "")
+              + f" · floor (5th pct) <b>{signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB</b>. Common SNR scale.")),
     ]
     def wins(x, y, higher_better=True):
         return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
