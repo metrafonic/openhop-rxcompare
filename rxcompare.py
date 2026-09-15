@@ -394,13 +394,17 @@ th:first-child,td:first-child{text-align:left}.wrap{overflow-x:auto}
 .select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:6px;padding:6px 10px;max-width:100%}
 tr.pick{cursor:pointer}tr.pick:hover td{background:var(--grid)}.hit.pick{cursor:pointer}
 details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600;font-size:14px}details[open]>summary{margin-bottom:8px}
-#tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}
+#tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 8px;border-radius:6px;opacity:0;transition:opacity .08s;white-space:pre;z-index:9}#tip.wide{white-space:pre-wrap;max-width:min(340px,calc(100vw - 24px));line-height:1.45;padding:8px 10px}
+.info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--muted);color:var(--muted);font-size:9.5px;font-weight:700;font-style:normal;line-height:1;margin-left:5px;vertical-align:.1em;cursor:help;user-select:none}.info:hover{border-color:var(--ink2);color:var(--ink2)}
 """
 
 JS = """
-const tip=document.getElementById('tip');
-document.addEventListener('mousemove',e=>{const t=e.target.closest('[data-tip]');if(!t){tip.style.opacity=0;return}
-tip.textContent=t.dataset.tip;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px';});
+const tip=document.getElementById('tip');let pinned=null;
+function showTip(t,x,y){tip.textContent=t.dataset.tip;tip.classList.toggle('wide',t.classList.contains('info'));tip.style.opacity=1;
+  const w=tip.offsetWidth,h=tip.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;
+  tip.style.left=Math.max(4,Math.min(x+14,vw-w-8))+'px';tip.style.top=(y+14+h>vh-8?y-h-10:y+14)+'px'}
+document.addEventListener('mousemove',e=>{if(pinned)return;const t=e.target.closest('[data-tip]');if(!t){tip.style.opacity=0;return}showTip(t,e.clientX,e.clientY)});
+document.addEventListener('click',e=>{const t=e.target.closest('.info');if(t&&pinned!==t){pinned=t;const r=t.getBoundingClientRect();showTip(t,r.left,r.bottom);e.stopPropagation()}else{pinned=null;tip.style.opacity=0}});
 
 // ---- neighbour explorer: per-packet view of one upstream hop, rendered client-side from embedded data
 (function(){
@@ -868,8 +872,40 @@ def segbar(segments, tip=""):
     return f'<div class="sbar" data-tip="{esc(tip)}"><div class="bar">{bar}</div><div class="seg">{"".join(labs)}</div></div>'
 
 
+INFO = {
+    "share": "Of every transmission at least one of the two nodes decoded, the share this node decoded. "
+             "Neither node transmits, so nothing is missed while busy sending: this is a clean receive comparison at the two positions.",
+    "ci": "95% confidence interval on the gap. Each transmission is a yes/no on each node, so the interval comes from the per-transmission difference (paired).",
+    "scale": "The two radios report SNR with a fixed-ish offset on the same packet (B − A is the mean over every packet both decoded). "
+             "For anything threshold-based — below −8 dB, the floor, the sensitivity curves — that offset is split between the nodes "
+             "(A shifted down by half, B up by half) so that '−8 dB' means the same signal on both sides. The offset itself is shown unshifted.",
+    "deep": "Packets decoded below −8 dB SNR on the common scale. Down there luck and collisions matter less and the front end decides, "
+            "so this is the most direct 'reaches deeper' number.",
+    "floor": "5th-percentile SNR of everything the node decoded, on the common scale: the level below which only 1 in 20 of its decodes happens. "
+             "More robust than the single weakest packet.",
+    "offset": "Mean SNR difference, B − A, over packets both nodes decoded. A constant offset is a reporting difference between the radios; "
+              "see 'Δ SNR by signal level' for whether it is constant.",
+    "one_sided": "A neighbour with at least 20 packets that one node hears under 50% of the time and the other over 85%. "
+                 "A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
+                 "(multipath nulls, obstruction, antenna orientation). Marked ◐ throughout.",
+    "matched": "Both nodes logged the same packet hash and path hash within 3 s of each other. The same transmission, received twice — "
+               "the only like-for-like basis for comparing SNR.",
+    "crc": "Preambles the radio detected but could not decode: packets at the edge of range, or false detections in noise. "
+           "More CRC errors together with fewer deep decodes points at a noisier front end.",
+    "noise": "The node's own noise-floor measurement. Partly a calibration difference between boards, so compare its movement over time rather than the absolute level.",
+    "level": "Δ SNR per 2 dB of signal level, using the mean of the two readings as the level so neither node's noise picks the bin. "
+             "Flat means a fixed reporting offset; a slope or a bend near the floor means the radios genuinely differ there.",
+    "curve": "For every transmission the reference node decoded at a given SNR (common scale), the share the other node also decoded. "
+             "The higher curve is the more sensitive receiver. Only neighbours both positions hear are included.",
+}
+
+
+def info(key):
+    return f'<i class="info" data-tip="{esc(INFO[key])}">i</i>'
+
+
 def tile(label, value, delta="", cls="", hero=False):
-    return (f'<div class="tile{" hero" if hero else ""}"><div class="l">{esc(label)}</div><div class="v{" hero" if hero else ""}">{value}</div>'
+    return (f'<div class="tile{" hero" if hero else ""}"><div class="l">{label}</div><div class="v{" hero" if hero else ""}">{value}</div>'
             f'<div class="d {cls}">{delta}</div></div>')
 
 
@@ -963,7 +999,7 @@ def render_html(R, nav="", refresh=0):
                        + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard(n)):.0f}% vs {100*min(heard(n)):.0f}%)" for n in one_sided)
                        + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
-    reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
+    reading_card = f'<div class="card reading"><h3>Reading{info("one_sided")}{info("scale")}</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
     # hero: what a mesh user asks first — which node hears more of what is on the air, and which one
     # reaches deeper into the noise. The shared-neighbour view lives in the Reading card and the table.
@@ -974,16 +1010,16 @@ def render_html(R, nav="", refresh=0):
     deep_verdict = (f"<b>{esc(deep_lead)} decodes {100*(deep_ratio-1):.0f}% more of the weakest packets</b>" if fa["deep"] + fb["deep"] >= 20 and deep_ratio >= 1.1
                     else "<b>Level</b>" if fa["deep"] + fb["deep"] >= 20 else "")
     tiles = [
-        (f'<div class="tile hero"><div class="l">Share of transmissions decoded</div>'
+        (f'<div class="tile hero"><div class="l">Share of transmissions decoded{info("share")}</div>'
          f'<div class="v hero"><span class="ch a">A</span>{100*rate_a:.1f}%<span class="ch b">B</span>{100*rate_b:.1f}%</div>{rate_bar}'
-         f'<div class="verdict">{verdict(gap, gap_ci, nb if gap > 0 else na)}</div>'
+         f'<div class="verdict">{verdict(gap, gap_ci, nb if gap > 0 else na)}{info("ci")}</div>'
          f'<div class="note">{union:,} transmissions at least one node decoded, {npair:,} by both.</div></div>') if union else tile("Share of transmissions decoded", "–"),
-        (f'<div class="tile"><div class="l">Reaches deeper: packets decoded below {signed(DEEP_DB)} dB SNR</div>'
+        (f'<div class="tile"><div class="l">Reaches deeper: packets decoded below {signed(DEEP_DB)} dB SNR{info("deep")}</div>'
          f'<div class="v"><span class="ch a">A</span>{fa["deep"]:,}<span class="ch b">B</span>{fb["deep"]:,}</div>'
          f'<div class="verdict">{deep_verdict}</div>'
          f'<div class="note">{fa["deep_pct"]:.0f}% / {fb["deep_pct"]:.0f}% of each node\'s packets · floor (5th pct) {signed(fa["snr_p5"], ".1f")} / {signed(fb["snr_p5"], ".1f")} dB '
-         f'· weakest {signed(fa["snr_min"], ".1f")} / {signed(fb["snr_min"], ".1f")} dB. Common SNR scale.</div></div>'),
-        tile("SNR on the same packet, B − A", f"{signed(md, '.2f')} dB" if npair else "–",
+         f'· weakest {signed(fa["snr_min"], ".1f")} / {signed(fb["snr_min"], ".1f")} dB. Common SNR scale{info("scale")}</div></div>'),
+        tile(f"SNR on the same packet, B − A{info('offset')}", f"{signed(md, '.2f')} dB" if npair else "–",
              f"<b>{esc(lead)} reads higher</b> on {100*max(better_a, better_b)/npair:.0f}% of {npair:,} shared packets (CI ±{ci:.2f}). "
              f"Largely a reporting offset between the radios — diagnostic, not the outcome." if npair else ""),
     ]
@@ -993,21 +1029,21 @@ def render_html(R, nav="", refresh=0):
         ca = ' class="win-a"' if win == "a" else ""; cb = ' class="win-b"' if win == "b" else ""
         return f'<tr><td class="k">{k}</td><td{ca}>{va}</td><td{cb}>{vb}</td><td class="k">{tip}</td></tr>'
     node_rows = "".join([
-        row("Decoded, of every transmission on the air", f"{100*rate_a:.1f}%", f"{100*rate_b:.1f}%", f"{union:,} distinct transmissions; higher is better", wins(rate_a, rate_b)),
-        row("… shared neighbours only", f"{100*ex_rate_a:.1f}%", f"{100*ex_rate_b:.1f}%", f"{ex_union:,} transmissions, without {', '.join(esc(h) for h in R['one_sided'])}", wins(ex_rate_a, ex_rate_b)) if one_sided else "",
+        row(f"Decoded, of every transmission on the air{info('share')}", f"{100*rate_a:.1f}%", f"{100*rate_b:.1f}%", f"{union:,} distinct transmissions; higher is better", wins(rate_a, rate_b)),
+        row(f"… shared neighbours only{info('one_sided')}", f"{100*ex_rate_a:.1f}%", f"{100*ex_rate_b:.1f}%", f"{ex_union:,} transmissions, without {', '.join(esc(h) for h in R['one_sided'])}", wins(ex_rate_a, ex_rate_b)) if one_sided else "",
         row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}", "", wins(A["n"], B["n"])),
         row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "packets the other node missed"),
         row("Average SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low means the other node ran out of sensitivity; high means collisions or timing"),
-        row(f"Decoded below {signed(DEEP_DB)} dB SNR", f"{fa['deep']:,} <small>({fa['deep_pct']:.0f}%)</small>", f"{fb['deep']:,} <small>({fb['deep_pct']:.0f}%)</small>",
+        row(f"Decoded below {signed(DEEP_DB)} dB SNR{info('deep')}{info('scale')}", f"{fa['deep']:,} <small>({fa['deep_pct']:.0f}%)</small>", f"{fb['deep']:,} <small>({fb['deep_pct']:.0f}%)</small>",
             "deep in the noise, where sensitivity rather than luck decides; common SNR scale; higher is better", wins(fa["deep"], fb["deep"])),
-        row("Sensitivity floor (5th percentile SNR)", f"{fmt(fa['snr_p5'],0,1)} dB <small>(weakest {fmt(fa['snr_min'],0,1)})</small>", f"{fmt(fb['snr_p5'],0,1)} dB <small>(weakest {fmt(fb['snr_min'],0,1)})</small>",
+        row(f"Sensitivity floor (5th percentile SNR){info('floor')}", f"{fmt(fa['snr_p5'],0,1)} dB <small>(weakest {fmt(fa['snr_min'],0,1)})</small>", f"{fmt(fb['snr_p5'],0,1)} dB <small>(weakest {fmt(fb['snr_min'],0,1)})</small>",
             "the level below which only 1 in 20 decodes happens; common SNR scale; lower is better",
             wins(fa["snr_p5"], fb["snr_p5"], False) if abs(fa["snr_p5"] - fb["snr_p5"]) >= 0.25 else ""),
-        row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB", "partly a reading offset between the radios"),
+        row(f"Mean SNR, matched packets{info('offset')}", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB", "partly a reading offset between the radios"),
         row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio, see the RSSI scatter"),
-        row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm",
+        row(f"Noise floor avg / min{info('noise')}", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm",
             "node's own measurement; lower is quieter, but partly calibration", wins(mean(nz_a), mean(nz_b), False)),
-        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}",
+        row(f"CRC errors{info('crc')}", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}",
             "preambles detected but not decoded: packets at the edge, or false detections in noise"),
     ])
     node_table = (f'<div class="card wrap"><table class="nodes"><thead><tr><th></th>'
@@ -1130,7 +1166,7 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <p class="meta">{len(A['only']):,} transmissions only {esc(na)} decoded, {len(B['only']):,} only {esc(nb)}.</p>
 <div class="grid2">
 <div class="card"><h3>How weak were they</h3><p>SNR of packets the other node missed. Misses on the left are the other node running out of sensitivity; misses on the right are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
-<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. ◐ marks a one-sided neighbour, heard from one position only. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb, os_hops)}{excl_note}</div>
+<div class="card"><h3>Which neighbours were missed{info("one_sided")}</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. ◐ marks a one-sided neighbour, heard from one position only. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb, os_hops)}{excl_note}</div>
 </div>
 </section>
 
@@ -1138,15 +1174,15 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <h2>Sensitivity or collisions?</h2>
 <p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air. These are questions about the radios, so this section uses only the neighbours both positions hear{f" ({', '.join(esc(h) for h in R['one_sided'])} left out)" if one_sided else ""}.</p>
 <div class="grid2">
-<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. The higher curve is the more sensitive receiver. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Readings are on a common scale (the {signed(md, ".2f")} dB offset between the radios split between them).</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
-<div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
+<div class="card"><h3>Chance the other node decoded it too{info("curve")}{info("scale")}</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. The higher curve is the more sensitive receiver. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Readings are on a common scale (the {signed(md, ".2f")} dB offset between the radios split between them).</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Δ SNR by signal level, B − A{info("level")}</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>
 </section>
 
 <section id="matched">
 <h2>The same transmission, heard by both</h2>
-<p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
+<p class="meta">{npair:,} transmissions decoded by both nodes{info("matched")}. This is the like-for-like comparison.</p>
 {clock_note}
 <div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
@@ -1179,9 +1215,9 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together. {partial}</p>{leg}{cnt_chart}</div>
 <div class="card"><h3>Decode rate per {R['bucket']//60} min</h3><p>Each node's share of the transmissions at least one of them decoded in that bucket. Shows whether the gap is steady or comes with traffic bursts or noise.</p>{leg}{rate_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
-<div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
-<div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min</h3><p>The floor stat over time, on the common SNR scale. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
-<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded: packets at the edge, or false detections in noise. Read with the chart on the left — more CRC errors <em>and</em> fewer deep decodes points at a noisier front end. {partial}</p>{leg}{crc_chart}</div>
+<div class="card"><h3>Noise floor, dBm{info("noise")}</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
+<div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min{info("scale")}</h3><p>The floor stat over time, on the common SNR scale. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
+<div class="card"><h3>CRC errors per {R['bucket']//60} min{info("crc")}</h3><p>Preambles detected but not decoded: packets at the edge, or false detections in noise. Read with the chart on the left — more CRC errors <em>and</em> fewer deep decodes points at a noisier front end. {partial}</p>{leg}{crc_chart}</div>
 </div>
 </section>
 
