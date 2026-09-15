@@ -549,7 +549,7 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600
 #geo .legend .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--muted);margin-right:5px;vertical-align:-1px}#geo .legend .dot.small{width:6px;height:6px;margin-right:3px}
 #geo .legend .dot.split{width:13px;height:13px;background:linear-gradient(to right,var(--a) 65%,var(--b) 65%);vertical-align:-2px}
 #geo .legend .dot.win{width:11px;height:11px;background:linear-gradient(to right,var(--a) 35%,var(--b) 35%);box-shadow:0 0 0 1px var(--surface),0 0 0 3px var(--b);margin:0 9px 0 4px}
-#geo .legend .dot.os{width:11px;height:11px;background:linear-gradient(to right,var(--a) 90%,var(--b) 90%);box-shadow:0 0 0 1px var(--surface),0 0 0 3px var(--a),0 0 0 4px var(--ink);margin:0 10px 0 5px}
+#geo .legend .dot.os{width:11px;height:11px;background:linear-gradient(to right,var(--a) 90%,var(--b) 90%);box-shadow:0 0 0 1px var(--surface),0 0 0 3px var(--a),0 0 0 5px var(--ink);margin:0 11px 0 6px}
 .geo-dot{display:block;border-radius:50%}#geo-tbl .sw{margin-left:4px;margin-right:10px}
 #geo .legend .line{display:inline-block;width:22px;height:0;border-top:2px solid var(--muted);opacity:.45;margin-right:6px;vertical-align:3px}
 #geo-radar svg{overflow:visible}.lbl.hop{font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--surface);stroke-width:3px;stroke-linejoin:round}.ring{fill:none;stroke:var(--grid)}.ring.major{stroke:var(--axis)}.spoke{stroke:var(--grid)}.compass{fill:var(--ink2);font-size:12px;font-weight:600}
@@ -677,11 +677,11 @@ function splitCircle(cx,cy,r,n){const A=tok('--a'),B=tok('--b'),surf=tok('--surf
     +(f>.005&&f<.995?`<path d="M${x.toFixed(2)} ${(cy-h).toFixed(2)} A${r} ${r} 0 ${f>.5?1:0} 0 ${x.toFixed(2)} ${(cy+h).toFixed(2)} Z" fill="${A}"/>`:'');
   s+=`<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${surf}" stroke-width="2"/>`;   // hairline of surface, then the winner's ring
   if(w)s+=`<circle cx="${cx}" cy="${cy}" r="${r+2}" fill="none" stroke="${w==='a'?A:B}" stroke-width="2"/>`;
-  if(n.os)s+=`<circle cx="${cx}" cy="${cy}" r="${r+4}" fill="none" stroke="var(--ink)" stroke-width="1"/>`;
+  if(n.os)s+=`<circle cx="${cx}" cy="${cy}" r="${r+4.5}" fill="none" stroke="var(--ink)" stroke-width="1.5"/>`;
   return s}
 const gradient=n=>{const f=(100*frac(n)).toFixed(0);return `linear-gradient(to right,${tok('--a')} ${f}%,${tok('--b')} ${f}%)`};
 // on the map a level neighbour gets no outline at all: the surface hairline only separates the fill from a winner's ring
-const rings=n=>{const w=winner(n);let r=[];if(w)r.push(`0 0 0 1px ${tok('--surface')}`,`0 0 0 3px ${tok(w==='a'?'--a':'--b')}`);if(n.os)r.push(`0 0 0 ${w?4:1}px ${tok('--ink')}`);return r.join(',')||'none'};
+const rings=n=>{const w=winner(n);let r=[];if(w)r.push(`0 0 0 1px ${tok('--surface')}`,`0 0 0 3px ${tok(w==='a'?'--a':'--b')}`);if(n.os)r.push(`0 0 0 ${w?5:1.5}px ${tok('--ink')}`);return r.join(',')||'none'};
 const size=pk=>4+9*Math.sqrt(pk/NMAX), evid=pk=>.18+.5*Math.sqrt(pk/NMAX);
 const tipFor=n=>`${n.hop}${n.name?' · '+n.name:''}\n${compass(n.brg)} ${Math.round(n.brg)}° · ${two?`A ${fmtKm(n.da)} / B ${fmtKm(n.db)}`:fmtKm(n.d)}\n${n.pk} packets · heard by A ${pct(n.ra)} · B ${pct(n.rb)}\nSNR on matched  A ${db(n.sa)} · B ${db(n.sb)} dB${n.os?'\n◐ one-sided: heard from one position only':''}`;
 const pick=hop=>{picked=picked===hop?null:hop;render();
@@ -1508,7 +1508,7 @@ def render_html(R, nav="", refresh=0):
     tile_host = MAP_TILES.split("/")[2].replace("{s}.", "") if MAP_TILES.count("/") >= 2 else MAP_TILES
     geo_legend = ('<div class="legend"><span><span class="dot split"></span>share decoded by <span class="ch a">A</span>/ <span class="ch b">B</span></span>'
                   '<span><span class="dot win"></span>ring: who decodes more</span><span><span class="dot small"></span><span class="dot"></span>packets</span>'
-                  '<span><span class="dot os"></span>one-sided</span><span><span class="line"></span>evidence</span></div>')
+                  '<span><span class="dot os"></span>outer ring: one-sided, heard from one position only</span><span><span class="line"></span>line: evidence</span></div>')
     if not g["mid"]:
         geo_section = (f'<section id="geo"><h2>Where the neighbours are{info("geo")}</h2><p class="meta">Neither node reports a position, so the neighbours cannot be placed. '
                        f'Set the repeater\'s latitude/longitude in openHop (or A_LAT/A_LON, B_LAT/B_LON here) to get a map, a bearing-and-distance view and SNR against distance.</p></section>')
