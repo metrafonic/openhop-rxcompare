@@ -881,7 +881,7 @@ def render_html(R, nav="", refresh=0):
                       tip=f"only {na}: {oa:,} ({100*oa/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {nb}: {ob:,} ({100*ob/union:.1f}%)") if union else ""
     snr_bar = segbar([(better_a / npair, "a", f"A {100*better_a/npair:.0f}%"), (ties / npair, "n", f"tie {100*ties/npair:.0f}%"), (better_b / npair, "b", f"B {100*better_b/npair:.0f}%")],
                      tip=f"{na} better: {better_a:,}\ntie: {ties:,}\n{nb} better: {better_b:,}") if npair else ""
-    # neighbours one antenna hears and the other barely does: placement, not receiver, and they move every
+    # neighbours one node hears and the other barely does: position, not receiver, and they move every
     # sensitivity number. Report the decode rate without them alongside the full one.
     def heard(n):
         u = n["both"] + n["a"] + n["b"]
@@ -940,7 +940,8 @@ def render_html(R, nav="", refresh=0):
         who = lambda n: na if heard(n)[0] > heard(n)[1] else nb
         reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
                        + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard(n)):.0f}% vs {100*min(heard(n)):.0f}%)" for n in one_sided)
-                       + ". That is antenna placement or pattern, not the receiver; swap antennas to tell which.")
+                       + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
+                         "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
     reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
     tiles = [
@@ -1108,7 +1109,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <h2>Sensitivity or collisions?</h2>
 <p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air.</p>
 <div class="grid2">
-<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Each curve is on the reference node's own SNR scale, so the {signed(md, ".2f")} dB reading offset shifts one curve sideways relative to the other, and a single threshold-level neighbour heard by one antenna can move a whole bin.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Each curve is on the reference node's own SNR scale, so the {signed(md, ".2f")} dB reading offset shifts one curve sideways relative to the other, and a single threshold-level neighbour heard from only one position can move a whole bin.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
 <div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>

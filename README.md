@@ -11,7 +11,7 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 
 - **decode rate**: of every transmission at least one node heard, the share each node decoded,
   with a paired confidence interval and the same rate without *one-sided neighbours* (hops one
-  antenna hears and the other barely does — placement, not receiver)
+  node hears and the other barely does — position, not receiver)
 - a **Reading** card that turns the headline numbers into a few sentences: who decodes more,
   whether the SNR offset is flat across levels (reporting) or not (real), who reaches deeper,
   and which neighbours are one-sided
