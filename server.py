@@ -37,7 +37,7 @@ def log(*a):
 def nav_html(hours):
     links = "".join(f'<a href="/?hours={h:g}" class="{"on" if h == hours else ""}">{h:g} h</a>' for h in RANGES)
     return (f'<div class="nav">{links}<a href="/summary.json?hours={hours:g}">json</a>'
-            f'<span style="align-self:center;color:var(--muted);font-size:12px;margin-left:6px">refreshes every {REFRESH // 60} min</span></div>')
+            f'<span style="align-self:center;color:var(--muted);font-size:12px;margin-left:6px">data refreshes every {REFRESH // 60} min — reload for the latest</span></div>')
 
 
 def compute(hours):
@@ -51,7 +51,7 @@ def compute(hours):
         t = time.time()
         try:
             R = rx.analyze(A, B, hours)
-            ent = {"ts": time.time(), "html": rx.render_html(R, nav_html(hours), refresh=REFRESH), "summary": rx.summary(R)}
+            ent = {"ts": time.time(), "html": rx.render_html(R, nav_html(hours)), "summary": rx.summary(R)}
             _cache[hours] = ent
             _last_error = None
             log(f"analysed {hours:g}h: {len(R['pairs'])} matched, {R['A']['n']}/{R['B']['n']} packets, {time.time()-t:.1f}s")
