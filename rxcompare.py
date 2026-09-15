@@ -150,19 +150,24 @@ def analyze(A, B, hours):
     sa = [p["snr"] for p, _ in pairs];  sb = [q["snr"] for _, q in pairs]
     drssi = [b - a for a, b in zip(ra, rb)]
     dsnr = [b - a for a, b in zip(sa, sb)]
+    # the two radios report SNR with a fixed-ish offset on the same packet; for every threshold-based
+    # stat (below −8 dB, weakest decoded, sensitivity curves) split that offset between them so a
+    # "−8 dB packet" means the same signal on both sides
+    md = mean(dsnr) if dsnr else 0.0
+    shift = {"a": md / 2, "b": -md / 2}
 
     # per upstream neighbour (last hop). Path hashes are 1-3 bytes of the same node id, so
     # "DB", "DB95" and "DB9570" are one neighbour: fold each hash into the longest one it prefixes.
     canon = hop_canon({p.get("upstream_hash") for p in pa} | {q.get("upstream_hash") for q in pb})
-    hop = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
+    hop_of = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
     nb_stats = defaultdict(lambda: {"both": 0, "a": 0, "b": 0, "ra": [], "rb": [], "sa": [], "sb": []})
     for p, q in pairs:
-        s = nb_stats[hop(p)]
+        s = nb_stats[hop_of(p)]
         s["both"] += 1; s["ra"].append(p["rssi"]); s["rb"].append(q["rssi"]); s["sa"].append(p["snr"]); s["sb"].append(q["snr"])
     for p in only_a:
-        nb_stats[hop(p)]["a"] += 1
+        nb_stats[hop_of(p)]["a"] += 1
     for q in only_b:
-        nb_stats[hop(q)]["b"] += 1
+        nb_stats[hop_of(q)]["b"] += 1
     neighbours = []
     for hop, s in sorted(nb_stats.items(), key=lambda kv: -(kv[1]["both"] + kv[1]["a"] + kv[1]["b"])):
         neighbours.append({"hop": hop, "both": s["both"], "a": s["a"], "b": s["b"],
@@ -183,12 +188,12 @@ def analyze(A, B, hours):
     for p, q in pairs:
         b = buckets[bi(p["timestamp"])]
         b["both"] += 1; b["a"] += 1; b["b"] += 1
-        b["deep_a"] += p["snr"] < DEEP_DB; b["deep_b"] += q["snr"] < DEEP_DB
+        b["deep_a"] += p["snr"] + shift["a"] < DEEP_DB; b["deep_b"] += q["snr"] + shift["b"] < DEEP_DB
         b["dsnr"].append(q["snr"] - p["snr"]); b["drssi"].append(q["rssi"] - p["rssi"])
     for p in only_a:
-        b = buckets[bi(p["timestamp"])]; b["a"] += 1; b["deep_a"] += p["snr"] < DEEP_DB
+        b = buckets[bi(p["timestamp"])]; b["a"] += 1; b["deep_a"] += p["snr"] + shift["a"] < DEEP_DB
     for q in only_b:
-        b = buckets[bi(q["timestamp"])]; b["b"] += 1; b["deep_b"] += q["snr"] < DEEP_DB
+        b = buckets[bi(q["timestamp"])]; b["b"] += 1; b["deep_b"] += q["snr"] + shift["b"] < DEEP_DB
     for b in buckets:
         b["dsnr"] = mean(b["dsnr"]); b["drssi"] = mean(b["drssi"])
     # the last bucket is only partly elapsed: scale its counts to a full-bucket rate so the line doesn't dip
@@ -203,34 +208,46 @@ def analyze(A, B, hours):
     # packet type mix over everything either node heard
     types = Counter(p["type"] for p in pa) | Counter(q["type"] for q in only_b)
 
+    # neighbours one node hears and the other barely does (≥20 packets, one side under 50%, the other
+    # over 85%) are a property of the two positions, not the receivers. The headline keeps them (that
+    # is what each node actually decoded); the sensitivity analyses below leave them out.
+    def heard(n):
+        u = n["both"] + n["a"] + n["b"]
+        return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
+    one_sided = [n["hop"] for n in neighbours if n["both"] + n["a"] + n["b"] >= 20 and min(heard(n)) < 0.5 and max(heard(n)) > 0.85]
+    os_hops = set(one_sided)
+    sh_pairs = [(p, q) for p, q in pairs if hop_of(p) not in os_hops]
+    sh_only_a = [p for p in only_a if hop_of(p) not in os_hops]
+    sh_only_b = [q for q in only_b if hop_of(q) not in os_hops]
+
     # sensitivity curves: given one node decoded a transmission at SNR s, did the other?
     # binned by the reference node's own reading, so each curve is on that node's scale
     LVL = 2
     lvl = lambda v: max(-14, min(12, math.floor(v / LVL) * LVL))
     curve = {"a_given_b": defaultdict(lambda: [0, 0]), "b_given_a": defaultdict(lambda: [0, 0])}  # bin -> [decoded, seen]
-    for p, q in pairs:
-        curve["b_given_a"][lvl(p["snr"])][0] += 1; curve["b_given_a"][lvl(p["snr"])][1] += 1
-        curve["a_given_b"][lvl(q["snr"])][0] += 1; curve["a_given_b"][lvl(q["snr"])][1] += 1
-    for p in only_a:
-        curve["b_given_a"][lvl(p["snr"])][1] += 1
-    for q in only_b:
-        curve["a_given_b"][lvl(q["snr"])][1] += 1
+    for p, q in sh_pairs:
+        curve["b_given_a"][lvl(p["snr"] + shift["a"])][0] += 1; curve["b_given_a"][lvl(p["snr"] + shift["a"])][1] += 1
+        curve["a_given_b"][lvl(q["snr"] + shift["b"])][0] += 1; curve["a_given_b"][lvl(q["snr"] + shift["b"])][1] += 1
+    for p in sh_only_a:
+        curve["b_given_a"][lvl(p["snr"] + shift["a"])][1] += 1
+    for q in sh_only_b:
+        curve["a_given_b"][lvl(q["snr"] + shift["b"])][1] += 1
     curves = {k: [{"snr": x, "decoded": v[0], "seen": v[1]} for x, v in sorted(c.items())] for k, c in curve.items()}
 
     # SNR delta by signal level, keyed on the packet's mean reading so neither node's noise biases the bin
     by_level = defaultdict(list)
-    for p, q in pairs:
+    for p, q in sh_pairs:
         by_level[lvl((p["snr"] + q["snr"]) / 2)].append(q["snr"] - p["snr"])
     dsnr_by_level = [{"snr": x, "n": len(v), "mean": mean(v), "ci": 1.96 * st.pstdev(v) / math.sqrt(len(v)) if len(v) > 1 else NAN}
                      for x, v in sorted(by_level.items())]
 
     # decode rate per payload type (long packets collide more; short ones mostly test sensitivity)
     tstat = defaultdict(lambda: {"both": 0, "a": 0, "b": 0, "len": []})
-    for p, q in pairs:
+    for p, q in sh_pairs:
         tstat[p["type"]]["both"] += 1; tstat[p["type"]]["len"].append(p["length"])
-    for p in only_a:
+    for p in sh_only_a:
         tstat[p["type"]]["a"] += 1; tstat[p["type"]]["len"].append(p["length"])
-    for q in only_b:
+    for q in sh_only_b:
         tstat[q["type"]]["b"] += 1; tstat[q["type"]]["len"].append(q["length"])
     by_type = [{"type": t, "name": TYPE_NAMES.get(t, f"type {t}"), "both": v["both"], "a": v["a"], "b": v["b"],
                 "n": v["both"] + v["a"] + v["b"], "len": mean(v["len"])}
@@ -249,6 +266,11 @@ def analyze(A, B, hours):
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
+        "one_sided": one_sided,
+        "shared": {"pairs": len(sh_pairs), "only_a": len(sh_only_a), "only_b": len(sh_only_b),
+                   "deep_a": sum(1 for p, _ in sh_pairs if p["snr"] + shift["a"] < DEEP_DB) + sum(1 for p in sh_only_a if p["snr"] + shift["a"] < DEEP_DB),
+                   "deep_b": sum(1 for _, q in sh_pairs if q["snr"] + shift["b"] < DEEP_DB) + sum(1 for q in sh_only_b if q["snr"] + shift["b"] < DEEP_DB)},
+        "snr_shift": shift,
     }
 
 
@@ -269,7 +291,7 @@ def print_report(R):
     print(f"{'':{W}}  {'packets':>8} {'decoded':>8} {'matched':>8} {'only':>6} {'RSSI avg':>9} {'RSSI med':>9} "
           f"{'SNR avg':>8} {'SNR med':>8} {'SNR min':>8} {f'<{DEEP_DB}dB':>7} {'noise avg':>10} {'noise min':>10} {'CRC err':>8}")
     for n in (A, B):
-        nz = [v for _, v in n["noise"]]; fs = floor_stats(n)
+        nz = [v for _, v in n["noise"]]; fs = floor_stats(n, R["snr_shift"]["a" if n is A else "b"])
         print(f"{n['name']:{W}}  {n['n']:8d} {100*n['n']/union if union else NAN:7.1f}% {len(pairs):8d} {len(n['only']):6d} {fmt(mean(n['rssi']),9)} {fmt(med(n['rssi']),9)} "
               f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(fs['snr_min'],8,1)} {fs['deep']:7d} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
     print("-" * 96)
@@ -348,14 +370,14 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
-.tile .v.hero{font-size:38px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
+.tile .v.hero{font-size:38px}.tile .sub{font-size:20px;font-weight:600;line-height:1.2;margin:10px 0 2px;color:var(--ink)}.tile .sub .ch{font-size:12px;padding:3px 5px 2px;vertical-align:.3em;margin:0 5px 0 0}.tile .sub .ch.b{margin-left:10px}.tile .sub .k{font-size:12px;font-weight:400;color:var(--ink2);margin-left:6px}.tile .d>div{margin-top:4px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
 .top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
 .sbar{margin:8px 0 4px}.sbar .bar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.sbar .bar i{display:block;height:100%}.sbar .a{background:var(--a)}.sbar .b{background:var(--b)}.sbar .n{background:var(--axis)}
 .sbar .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.sbar .seg span{text-align:center;overflow:hidden}.sbar .seg span.l{text-align:left;overflow:visible}.sbar .seg span.r{text-align:right;overflow:visible;direction:rtl}
 
-.nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}.nodes small{color:var(--muted);font-size:11px;margin-left:2px}
+.nodes{font-variant-numeric:tabular-nums}.nodes th{text-align:right}.nodes th:first-child{text-align:left}.nodes td.k{color:var(--ink2)}.nodes td.win-a{color:var(--a);font-weight:600}.nodes td.win-b{color:var(--b);font-weight:600}.nodes small{color:var(--muted);font-size:11px;margin-left:2px}
 .nodes td,.nodes th{width:1%}.nodes td:last-child{width:auto;text-align:left;font-size:12px;padding-left:18px}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:28px}
 @media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
 .nodes .sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
@@ -554,14 +576,14 @@ def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--ink2)", clam
     return s.render()
 
 
-def chart_excl_neighbours(neigh, na, nb):
+def chart_excl_neighbours(neigh, na, nb, flag=frozenset()):
     """Diverging counts per upstream hop: packets only A decoded (left) vs only B (right)."""
     rows = sorted([n for n in neigh if n["a"] + n["b"] >= 3], key=lambda n: -(n["a"] + n["b"]))[:16]
     if not rows:
         return "<p>no exclusive packets yet</p>"
     mx = max(max(n["a"], n["b"]) for n in rows) or 1
     rh = 20
-    s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=96, mr=16, mt=8, mb=26)
     s.scales(-mx * 1.15, mx * 1.15, 0, len(rows))
     s.axes(nice_ticks(-mx, mx, 6), [], xfmt=lambda t: f"{abs(t):g}", y0=False)
     s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
@@ -575,10 +597,10 @@ def chart_excl_neighbours(neigh, na, nb):
             d = (f"M{x0:.1f},{y}h{w-r:.1f}q{r},0 {r},{r}v{rh-8-2*r}q0,{r} -{r},{r}h-{w-r:.1f}Z" if sign > 0 else
                  f"M{x1:.1f},{y}h-{w-r:.1f}q-{r},0 -{r},{r}v{rh-8-2*r}q0,{r} {r},{r}h{w-r:.1f}Z")
             s.add(f'<path class="mark" fill="{col}" d="{d}"/>')
-        s.add(f'<rect class="hit pick" data-hop="{esc(n["hop"])}" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}: '
+        s.add(f'<rect class="hit pick" data-hop="{esc(n["hop"])}" x="{s.ml}" y="{y-2}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="hop {esc(n["hop"])}{" ◐ one-sided: heard from one position only" if n["hop"] in flag else ""}: '
               f'only {esc(na)} {n["a"]}, only {esc(nb)} {n["b"]}, both {n["both"]}"/>')
-        s.add(f'<text x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
-        s.add(f'<text x="{s.ml-8-46}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
+        s.add(f'<text x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{"<tspan fill=\"var(--muted)\">◐ </tspan>" if n["hop"] in flag else ""}{esc(n["hop"])}</text>')
+        s.add(f'<text x="{s.ml-8-58}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
     return s.render()
 
 
@@ -687,7 +709,7 @@ def chart_type_rates(by_type, na, nb, min_n=10):
     return s.render()
 
 
-def chart_dumbbell(neigh, na, nb):
+def chart_dumbbell(neigh, na, nb, flag=frozenset()):
     """Per neighbour: mean SNR on A and on B as two dots joined by a line, strongest at the top."""
     rows = sorted([n for n in neigh if n["both"] >= 3], key=lambda n: -(n["snr_a"] + n["snr_b"]))[:20]
     if not rows:
@@ -695,7 +717,7 @@ def chart_dumbbell(neigh, na, nb):
     vals = [v for n in rows for v in (n["snr_a"], n["snr_b"])]
     lo, hi = min(vals) - 1.5, max(vals) + 1.5
     rh = 20
-    s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=96, mr=16, mt=8, mb=26)
     s.scales(lo, hi, 0, len(rows))
     s.axes(nice_ticks(lo, hi, 6), [], xfmt=signed, y0=False)
     if lo < 0 < hi:
@@ -708,8 +730,8 @@ def chart_dumbbell(neigh, na, nb):
         s.add(f'<line x1="{xa:.1f}" x2="{xb:.1f}" y1="{cy:.1f}" y2="{cy:.1f}" stroke="var(--axis)" stroke-width="2"/>')
         for x, col in ((xa, "var(--a)"), (xb, "var(--b)")):
             s.add(f'<circle class="mark" cx="{x:.1f}" cy="{cy:.1f}" r="5" fill="{col}" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
-        s.add(f'<text x="{s.ml-8}" y="{cy+4:.1f}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
-        s.add(f'<text x="{s.ml-8-46}" y="{cy+4:.1f}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
+        s.add(f'<text x="{s.ml-8}" y="{cy+4:.1f}" text-anchor="end" fill="var(--ink2)" font-size="11">{"<tspan fill=\"var(--muted)\">◐ </tspan>" if n["hop"] in flag else ""}{esc(n["hop"])}</text>')
+        s.add(f'<text x="{s.ml-8-58}" y="{cy+4:.1f}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
     return s.render()
 
 
@@ -807,14 +829,14 @@ def chart_lines(series, ts, yfmt=lambda v: f"{v:g}", zero=False, ylo=None, yhi=N
     return s.render()
 
 
-def chart_neighbours(neigh, na, nb):
+def chart_neighbours(neigh, na, nb, flag=frozenset()):
     """Horizontal diverging bars: ΔSNR (B−A) per upstream hop; colour = whichever node is better."""
     rows = [n for n in neigh if n["both"] >= 3][:20]
     if not rows:
         return "<p>not enough matched packets per neighbour yet</p>"
     mx = max(abs(n["dsnr"]) for n in rows) or 1
     rh = 20
-    s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=96, mr=16, mt=8, mb=26)
     s.scales(-mx * 1.15, mx * 1.15, 0, len(rows))
     s.axes(nice_ticks(-mx, mx, 6), [], xfmt=signed, y0=False)
     s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
@@ -829,8 +851,8 @@ def chart_neighbours(neigh, na, nb):
               f'{n["a"]} only {esc(na)}, {n["b"]} only {esc(nb)}\\nSNR {esc(na)} {n["snr_a"]:.1f}  {esc(nb)} {n["snr_b"]:.1f}  Δ {n["dsnr"]:+.2f} dB\\n'
               f'RSSI {esc(na)} {n["rssi_a"]:.0f}  {esc(nb)} {n["rssi_b"]:.0f}  Δ {n["drssi"]:+.1f} dB"/>')
         s.add(f'<path class="mark" fill="{col}" d="{d}"/>')
-        s.add(f'<text class="ax" x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(n["hop"])}</text>')
-        s.add(f'<text x="{s.ml-8-46}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
+        s.add(f'<text class="ax" x="{s.ml-8}" y="{y+rh-9}" text-anchor="end" fill="var(--ink2)" font-size="11">{"<tspan fill=\"var(--muted)\">◐ </tspan>" if n["hop"] in flag else ""}{esc(n["hop"])}</text>')
+        s.add(f'<text x="{s.ml-8-58}" y="{y+rh-9}" text-anchor="end" fill="var(--muted)" font-size="10">n={n["both"]}</text>')
     return s.render()
 
 
@@ -867,7 +889,7 @@ def render_html(R, nav="", refresh=0):
     leg = f'<div class="legend"><span><span class="ch a">A</span>{esc(na)}</span><span><span class="ch b">B</span>{esc(nb)}</span></div>'
 
     # ---- headline row + per-node table
-    fa, fb = floor_stats(A), floor_stats(B)
+    fa, fb = floor_stats(A, R["snr_shift"]["a"]), floor_stats(B, R["snr_shift"]["b"])
     union = npair + len(A["only"]) + len(B["only"])
     rate_a = A["n"] / union if union else NAN; rate_b = B["n"] / union if union else NAN
     md = mean(dsnr)
@@ -887,15 +909,13 @@ def render_html(R, nav="", refresh=0):
     def heard(n):
         u = n["both"] + n["a"] + n["b"]
         return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
-    one_sided = [n for n in R["neighbours"] if n["both"] + n["a"] + n["b"] >= 20 and min(heard(n)) < 0.5 and max(heard(n)) > 0.85]
-    os_hops = {n["hop"] for n in one_sided}
-    ex_pairs = sum(1 for p, _ in pairs if hopname(p) not in os_hops)
-    ex_a = sum(1 for p in A["only"] if hopname(p) not in os_hops); ex_b = sum(1 for q in B["only"] if hopname(q) not in os_hops)
-    ex_union = ex_pairs + ex_a + ex_b
-    ex_rate_a = (ex_pairs + ex_a) / ex_union if ex_union else NAN; ex_rate_b = (ex_pairs + ex_b) / ex_union if ex_union else NAN
+    os_hops = set(R["one_sided"])
+    one_sided = [n for n in R["neighbours"] if n["hop"] in os_hops]
+    sh = R["shared"]
+    ex_union = sh["pairs"] + sh["only_a"] + sh["only_b"]
+    ex_rate_a = (sh["pairs"] + sh["only_a"]) / ex_union if ex_union else NAN; ex_rate_b = (sh["pairs"] + sh["only_b"]) / ex_union if ex_union else NAN
     ex_gap = ex_rate_b - ex_rate_a
-    ex_deep_a = sum(1 for p, _ in pairs if p["snr"] < DEEP_DB and hopname(p) not in os_hops) + sum(1 for p in A["only"] if p["snr"] < DEEP_DB and hopname(p) not in os_hops)
-    ex_deep_b = sum(1 for _, q in pairs if q["snr"] < DEEP_DB and hopname(q) not in os_hops) + sum(1 for q in B["only"] if q["snr"] < DEEP_DB and hopname(q) not in os_hops)
+    ex_deep_a, ex_deep_b = sh["deep_a"], sh["deep_b"]
     os_note = (f"Without {', '.join(esc(n['hop']) for n in one_sided)}: "
                f"<span class=\"ch a\">A</span>{100*ex_rate_a:.1f}% <span class=\"ch b\">B</span>{100*ex_rate_b:.1f}%." if one_sided else "")
 
@@ -930,13 +950,15 @@ def render_html(R, nav="", refresh=0):
         hi, lo = (fb, fa) if fb["deep"] > fa["deep"] else (fa, fb)
         hn, ln = (nb, na) if fb["deep"] > fa["deep"] else (na, nb)
         ex_hi, ex_lo = (ex_deep_b, ex_deep_a) if hn == nb else (ex_deep_a, ex_deep_b)
+        gap_full, gap_sh = hi["deep"] - lo["deep"], ex_hi - ex_lo
+        share = 1 - gap_sh / gap_full if gap_full > 0 else 0
         ex_tail = (f" Without the one-sided neighbours it is {ex_hi:,} against {ex_lo:,}"
-                   + (", so most of that depth is those neighbours." if ex_hi < 1.25 * max(1, ex_lo) else ".")) if one_sided else ""
+                   + (f" — {100*share:.0f}% of that gap was those neighbours." if share > 0.2 else ".")) if one_sided else ""
         if hi["deep"] >= 1.25 * max(1, lo["deep"]):
-            reading.append(f"<b>{esc(hn)} reaches deeper</b>: {hi['deep']:,} packets decoded below {signed(DEEP_DB)} dB against {lo['deep']:,}, "
-                           f"weakest {signed(hi['snr_min'], '.1f')} vs {signed(lo['snr_min'], '.1f')} dB.{ex_tail}")
+            reading.append(f"<b>{esc(hn)} decodes more of the deep packets</b>: {hi['deep']:,} below {signed(DEEP_DB)} dB against {lo['deep']:,} on a common SNR scale; "
+                           f"5th-percentile floor {signed(hi['snr_p5'], '.1f')} vs {signed(lo['snr_p5'], '.1f')} dB.{ex_tail}")
         else:
-            reading.append(f"Both reach about the same floor: {fa['deep']:,} / {fb['deep']:,} packets below {signed(DEEP_DB)} dB, weakest {signed(fa['snr_min'], '.1f')} / {signed(fb['snr_min'], '.1f')} dB.")
+            reading.append(f"Both reach about the same floor: {fa['deep']:,} / {fb['deep']:,} packets below {signed(DEEP_DB)} dB, 5th-percentile floor {signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB.")
     if one_sided:
         who = lambda n: na if heard(n)[0] > heard(n)[1] else nb
         reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
@@ -946,35 +968,58 @@ def render_html(R, nav="", refresh=0):
     reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
     lead_d = (nb if gap > 0 else na) if union else ""
+    ex_bar = segbar([(sh["only_a"] / ex_union, "a", f"A only {100*sh['only_a']/ex_union:.0f}%"), (sh["pairs"] / ex_union, "n", f"both {100*sh['pairs']/ex_union:.0f}%"),
+                     (sh["only_b"] / ex_union, "b", f"B only {100*sh['only_b']/ex_union:.0f}%")],
+                    tip=f"shared neighbours only ({ex_union:,} transmissions)\nonly {na}: {sh['only_a']:,}\nboth: {sh['pairs']:,}\nonly {nb}: {sh['only_b']:,}") if one_sided and ex_union else ""
+    if union and abs(gap) > gap_ci:
+        head = f"<b>{esc(lead_d)} decodes {100*abs(gap):.1f} pts more</b> (±{100*gap_ci:.1f}) of {union:,} transmissions at these positions."
+    elif union:
+        head = f"Level within noise: gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts over {union:,} transmissions."
+    else:
+        head = ""
+    if one_sided:
+        ex_lead = nb if ex_gap > 0 else na
+        ex_head = (f"<b>{esc(ex_lead)} by {100*abs(ex_gap):.1f} pts</b>" if abs(ex_gap) > gap_ci else "<b>level</b>") + \
+                  f" on the {len(R['neighbours']) - len(one_sided)} neighbours both positions hear; {', '.join(esc(h) for h in R['one_sided'])} left out."
+        sub = (f'<div class="sub"><span class="ch a">A</span>{100*ex_rate_a:.1f}%<span class="ch b">B</span>{100*ex_rate_b:.1f}% '
+               f'<span class="k">shared neighbours only</span></div>{ex_bar}<div>{ex_head}</div>')
+    else:
+        sub = ""
     tiles = [
         tile("Decoded, of every transmission on the air",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             (f"{rate_bar}" + (f"<b>{esc(lead_d)} decodes {100*abs(gap):.1f} pts more</b> (±{100*gap_ci:.1f}) of {union:,} transmissions. " if abs(gap) > gap_ci
-                                else f"Level within noise: gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts over {union:,} transmissions. ") + os_note) if union else "",
-             hero=True),
+             f"{rate_bar}<div>{head}</div>{sub}" if union else "", hero=True),
         tile("SNR on the same packet, B − A", f"{signed(md, '.2f')} dB" if npair else "–",
-             f"{esc(lead)} reads cleaner on average; 95% CI ±{ci:.2f}, median {signed(med(dsnr), '.2f')} dB. Diagnostic, not the outcome." if npair else ""),
-        tile("Cleaner reading on the same packet",
-             f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
-             f"{snr_bar}{npair:,} matched packets; a tie is an identical SNR reading." if npair else ""),
+             f"{esc(lead)} reads cleaner on {100*max(better_a, better_b)/npair:.0f}% of {npair:,} shared packets; 95% CI ±{ci:.2f}, median {signed(med(dsnr), '.2f')} dB. "
+             f"A reading offset between the radios as much as a receive difference — diagnostic, not the outcome." if npair else ""),
+        tile(f"Decoded below {signed(DEEP_DB)} dB SNR",
+             f"<span class=\"ch a\">A</span>{fa['deep']:,}<span class=\"ch b\">B</span>{fb['deep']:,}",
+             (f"{fa['deep_pct']:.0f}% / {fb['deep_pct']:.0f}% of each node's packets; floor (5th pct) {signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB. "
+              + (f"Shared neighbours only: {ex_deep_a:,} / {ex_deep_b:,}. " if one_sided else "")
+              + f"Readings on a common scale (the {signed(md, '.2f')} dB offset split between the nodes). Where the front end decides.")),
     ]
-    def row(k, va, vb, tip=""):
-        return f'<tr><td class="k">{k}</td><td>{va}</td><td>{vb}</td><td class="k">{tip}</td></tr>'
     def wins(x, y, higher_better=True):
         return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
+    def row(k, va, vb, tip="", win=""):
+        ca = ' class="win-a"' if win == "a" else ""; cb = ' class="win-b"' if win == "b" else ""
+        return f'<tr><td class="k">{k}</td><td{ca}>{va}</td><td{cb}>{vb}</td><td class="k">{tip}</td></tr>'
     node_rows = "".join([
-        row("Decoded, of every transmission on the air", f"{100*rate_a:.1f}%", f"{100*rate_b:.1f}%", f"{union:,} distinct transmissions"),
-        row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}"),
+        row("Decoded, of every transmission on the air", f"{100*rate_a:.1f}%", f"{100*rate_b:.1f}%", f"{union:,} distinct transmissions; higher is better", wins(rate_a, rate_b)),
+        row("… shared neighbours only", f"{100*ex_rate_a:.1f}%", f"{100*ex_rate_b:.1f}%", f"{ex_union:,} transmissions, without {', '.join(esc(h) for h in R['one_sided'])}", wins(ex_rate_a, ex_rate_b)) if one_sided else "",
+        row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}", "", wins(A["n"], B["n"])),
         row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "packets the other node missed"),
         row("Average SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low means the other node ran out of sensitivity; high means collisions or timing"),
         row(f"Decoded below {signed(DEEP_DB)} dB SNR", f"{fa['deep']:,} <small>({fa['deep_pct']:.0f}%)</small>", f"{fb['deep']:,} <small>({fb['deep_pct']:.0f}%)</small>",
-            "deep in the noise, where sensitivity rather than luck decides"),
-        row("Weakest packet decoded", f"{fmt(fa['snr_min'],0,1)} dB <small>(5th pct {fmt(fa['snr_p5'],0,1)})</small>", f"{fmt(fb['snr_min'],0,1)} dB <small>(5th pct {fmt(fb['snr_p5'],0,1)})</small>",
-            "the node's practical sensitivity floor on this channel"),
-        row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB"),
+            "deep in the noise, where sensitivity rather than luck decides; common SNR scale; higher is better", wins(fa["deep"], fb["deep"])),
+        row("Sensitivity floor (5th percentile SNR)", f"{fmt(fa['snr_p5'],0,1)} dB <small>(weakest {fmt(fa['snr_min'],0,1)})</small>", f"{fmt(fb['snr_p5'],0,1)} dB <small>(weakest {fmt(fb['snr_min'],0,1)})</small>",
+            "the level below which only 1 in 20 decodes happens; common SNR scale; lower is better",
+            wins(fa["snr_p5"], fb["snr_p5"], False) if abs(fa["snr_p5"] - fb["snr_p5"]) >= 0.25 else ""),
+        row("Mean SNR, matched packets", f"{mean(A['snr']):.2f} dB", f"{mean(B['snr']):.2f} dB", "partly a reading offset between the radios"),
         row("Mean RSSI, matched packets", f"{mean(A['rssi']):.1f} dBm", f"{mean(B['rssi']):.1f} dBm", "calibration differs per radio, see the RSSI scatter"),
-        row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm", "node's own measurement"),
-        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}", "preambles detected in this window that failed to decode"),
+        row("Noise floor avg / min", f"{mean(nz_a):.1f} / {fmt(min(nz_a) if nz_a else NAN,0,1)} dBm", f"{mean(nz_b):.1f} / {fmt(min(nz_b) if nz_b else NAN,0,1)} dBm",
+            "node's own measurement; lower is quieter, but partly calibration", wins(mean(nz_a), mean(nz_b), False)),
+        row("CRC errors", f"{'≥' if A['crc_lower_bound'] else ''}{A['crc']:,}", f"{'≥' if B['crc_lower_bound'] else ''}{B['crc']:,}",
+            "preambles detected but not decoded: packets at the edge, or false detections in noise"),
     ])
     node_table = (f'<div class="card wrap"><table class="nodes"><thead><tr><th></th>'
                   f'<th><span class="ch a">A</span>{esc(na)}</th>'
@@ -1047,7 +1092,7 @@ def render_html(R, nav="", refresh=0):
         u = n["both"] + n["a"] + n["b"]
         ha, hb = (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
         hcell = lambda v, w, col: f'<td style="color:var(--{col})">{100*v:.0f}%</td>' if v - w >= 0.005 else f"<td>{100*v:.0f}%</td>"
-        nrows.append(f"<tr data-hop=\"{esc(n['hop'])}\" class=\"pick\"><td>{esc(n['hop'])}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>{hcell(ha, hb, 'a')}{hcell(hb, ha, 'b')}"
+        nrows.append(f"<tr data-hop=\"{esc(n['hop'])}\" class=\"pick\"><td>{esc(n['hop'])}{' <span title=\"one-sided: heard from one position only\" style=\"color:var(--muted)\">◐</span>' if n['hop'] in os_hops else ''}</td><td>{n['both']}</td><td>{n['a']}</td><td>{n['b']}</td>{hcell(ha, hb, 'a')}{hcell(hb, ha, 'b')}"
                      f"<td>{fmt(n['rssi_a'],0,1)}</td><td>{fmt(n['rssi_b'],0,1)}</td><td>{fmt(n['drssi'],0,1)}</td>"
                      f"<td>{fmt(n['snr_a'],0,2)}</td><td>{fmt(n['snr_b'],0,2)}</td><td>{dcell}</td></tr>")
 
@@ -1096,15 +1141,15 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <p class="meta">{len(A['only']):,} transmissions only {esc(na)} decoded, {len(B['only']):,} only {esc(nb)}.</p>
 <div class="grid2">
 <div class="card"><h3>How weak were they</h3><p>SNR of packets the other node missed. Misses on the left are the other node running out of sensitivity; misses on the right are collisions or timing.</p>{leg}{chart_hist2(only_a_snr, only_b_snr, -14, 12, 2, na, nb)}</div>
-<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb)}{excl_note}</div>
+<div class="card"><h3>Which neighbours were missed</h3><p>Per upstream hop: packets only {esc(na)} decoded (left) and only {esc(nb)} decoded (right). n is how many both decoded. ◐ marks a one-sided neighbour, heard from one position only. Click a row to explore it.</p>{leg}{chart_excl_neighbours(R['neighbours'], na, nb, os_hops)}{excl_note}</div>
 </div>
 </section>
 
 <section id="sensitivity">
 <h2>Sensitivity or collisions?</h2>
-<p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air.</p>
+<p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air. These are questions about the radios, so this section uses only the neighbours both positions hear{f" ({', '.join(esc(h) for h in R['one_sided'])} left out)" if one_sided else ""}.</p>
 <div class="grid2">
-<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Each curve is on the reference node's own SNR scale, so the {signed(md, ".2f")} dB reading offset shifts one curve sideways relative to the other, and a single threshold-level neighbour heard from only one position can move a whole bin.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. The higher curve is the more sensitive receiver. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Readings are on a common scale (the {signed(md, ".2f")} dB offset between the radios split between them).</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
 <div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>
@@ -1122,10 +1167,10 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 
 <section id="neighbours">
 <h2>By upstream neighbour</h2>
-<p class="meta">Last hop before this node. Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form.</p>
+<p class="meta">Last hop before this node. Path hashes of different lengths that refer to the same node (<code>DB</code>, <code>DB95</code>, <code>DB9570</code>) are merged under the longest form. ◐ marks a one-sided neighbour: heard from one position only, so it says where the boards sit, not which radio is better.</p>
 <div class="grid2">
-<div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better. Click a row to explore it.</p>{chart_neighbours(R['neighbours'], na, nb)}</div>
-<div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb)}</div>
+<div class="card"><h3>Δ SNR per neighbour, B − A</h3><p>Averaged over matched packets, last hop with at least 3 matches. Bar colour is the node that hears that neighbour better. Click a row to explore it.</p>{chart_neighbours(R['neighbours'], na, nb, os_hops)}</div>
+<div class="card"><h3>Mean SNR per neighbour, on each node</h3><p>Strongest neighbours at the top. Neighbours near the decode threshold (below about −5 dB) are where a sensitivity difference shows; strong ones tell you little.</p>{leg}{chart_dumbbell(R['neighbours'], na, nb, os_hops)}</div>
 </div>
 </section>
 
@@ -1146,8 +1191,8 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <div class="card"><h3>Decode rate per {R['bucket']//60} min</h3><p>Each node's share of the transmissions at least one of them decoded in that bucket. Shows whether the gap is steady or comes with traffic bursts or noise.</p>{leg}{rate_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
 <div class="card"><h3>Noise floor, dBm</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
-<div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min</h3><p>The floor stat over time. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
-<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded. More CRC errors at the same decode count usually means the radio hears further out into the noise. {partial}</p>{leg}{crc_chart}</div>
+<div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min</h3><p>The floor stat over time, on the common SNR scale. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
+<div class="card"><h3>CRC errors per {R['bucket']//60} min</h3><p>Preambles detected but not decoded: packets at the edge, or false detections in noise. Read with the chart on the left — more CRC errors <em>and</em> fewer deep decodes points at a noisier front end. {partial}</p>{leg}{crc_chart}</div>
 </div>
 </section>
 
@@ -1177,10 +1222,11 @@ def write_html(R, path):
     print(f"wrote {path}")
 
 
-def floor_stats(n):
+def floor_stats(n, shift=0.0):
     """Sensitivity floor of one node over every packet it decoded (matched and exclusive):
-    weakest SNR, 5th percentile, and how many were below DEEP_DB."""
-    vs = sorted(n["snr"] + [p["snr"] for p in n["only"]])
+    weakest SNR, 5th percentile, and how many were below DEEP_DB. `shift` puts the node's
+    readings on the common scale (half the reading offset between the two radios)."""
+    vs = sorted(v + shift for v in n["snr"] + [p["snr"] for p in n["only"]])
     if not vs:
         return {"snr_min": NAN, "snr_p5": NAN, "deep": 0, "deep_pct": NAN}
     return {"snr_min": vs[0], "snr_p5": vs[len(vs) // 20], "deep": sum(1 for v in vs if v < DEEP_DB),
@@ -1192,17 +1238,15 @@ def summary(R):
     A, B = R["A"], R["B"]
     def side(n):
         u = len(R["pairs"]) + len(A["only"]) + len(B["only"])
+        sh_ = R["snr_shift"]["a" if n is A else "b"]
         return {"name": n["name"], "packets": n["n"], "only": len(n["only"]), "decode_rate": n["n"] / u if u else NAN,
                 "only_snr_avg": mean([p["snr"] for p in n["only"]]),
                 "snr_avg": mean(n["snr"]), "rssi_avg": mean(n["rssi"]),
                 "noise_avg": mean([v for _, v in n["noise"]]), "crc_errors": n["crc"],
-                **floor_stats(n)}
+                **floor_stats(n, sh_)}
     union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
-    def heard(n):
-        u = n["both"] + n["a"] + n["b"]
-        return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
-    one_sided = [n["hop"] for n in R["neighbours"] if n["both"] + n["a"] + n["b"] >= 20 and min(heard(n)) < 0.5 and max(heard(n)) > 0.85]
-    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union, "one_sided_neighbours": one_sided,
+    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
+         "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"],
          "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),
