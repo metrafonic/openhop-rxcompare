@@ -370,10 +370,10 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
-.tile .v.hero{font-size:38px}.halves{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:18px;margin-top:6px}.half .h{font-size:12.5px;font-weight:600;color:var(--ink);margin-bottom:2px}.half .v{font-size:30px}.half .verdict{font-size:14px;margin-top:8px;color:var(--ink)}.half .verdict .k{color:var(--ink2);font-size:12px;font-weight:400}.half .note{font-size:11.5px;color:var(--ink2);margin-top:2px}.tile .sub{font-size:20px;font-weight:600;line-height:1.2;margin:10px 0 2px;color:var(--ink)}.tile .sub .ch{font-size:12px;padding:3px 5px 2px;vertical-align:.3em;margin:0 5px 0 0}.tile .sub .ch.b{margin-left:10px}.tile .sub .k{font-size:12px;font-weight:400;color:var(--ink2);margin-left:6px}.tile .d>div{margin-top:4px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
+.tile .v.hero{font-size:38px}.tile .verdict{font-size:14px;margin-top:8px;color:var(--ink)}.tile .verdict .k{color:var(--ink2);font-size:12px;font-weight:400}.tile .note{font-size:11.5px;color:var(--ink2);margin-top:3px;line-height:1.45}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
-.top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:2fr 1fr 1fr}}
+.top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.4fr 1.2fr 1fr}}
 .sbar{margin:8px 0 4px}.sbar .bar{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.sbar .bar i{display:block;height:100%}.sbar .a{background:var(--a)}.sbar .b{background:var(--b)}.sbar .n{background:var(--axis)}
 .sbar .seg{display:flex;gap:2px;font-size:10.5px;letter-spacing:-.01em;color:var(--ink2);margin-top:3px;white-space:nowrap}.sbar .seg span{text-align:center;overflow:hidden}.sbar .seg span.l{text-align:left;overflow:visible}.sbar .seg span.r{text-align:right;overflow:visible;direction:rtl}
 
@@ -916,8 +916,6 @@ def render_html(R, nav="", refresh=0):
     ex_rate_a = (sh["pairs"] + sh["only_a"]) / ex_union if ex_union else NAN; ex_rate_b = (sh["pairs"] + sh["only_b"]) / ex_union if ex_union else NAN
     ex_gap = ex_rate_b - ex_rate_a
     ex_deep_a, ex_deep_b = sh["deep_a"], sh["deep_b"]
-    os_note = (f"Without {', '.join(esc(n['hop']) for n in one_sided)}: "
-               f"<span class=\"ch a\">A</span>{100*ex_rate_a:.1f}% <span class=\"ch b\">B</span>{100*ex_rate_b:.1f}%." if one_sided else "")
 
     # ---- the reading: a few sentences derived from the numbers, so the tiles don't contradict each other unexplained
     reading = []
@@ -967,33 +965,27 @@ def render_html(R, nav="", refresh=0):
                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
     reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
-    # hero: two panels side by side, same size — everything at these positions, and shared neighbours only
-    def panel(title, ra_, rb_, bar, verdict, note):
-        return (f'<div class="half"><div class="h">{title}</div>'
-                f'<div class="v"><span class="ch a">A</span>{100*ra_:.1f}%<span class="ch b">B</span>{100*rb_:.1f}%</div>{bar}'
-                f'<div class="verdict">{verdict}</div><div class="note">{note}</div></div>')
+    # hero: what a mesh user asks first — which node hears more of what is on the air, and which one
+    # reaches deeper into the noise. The shared-neighbour view lives in the Reading card and the table.
     def verdict(g, ci_, n_lead):
         return f"<b>{esc(n_lead)} +{100*abs(g):.1f} pts</b> <span class=\"k\">±{100*ci_:.1f}</span>" if abs(g) > ci_ else f"<b>Level</b> <span class=\"k\">gap {signed(100*g, '.1f')} ±{100*ci_:.1f}</span>"
-    panels = ""
-    if union:
-        panels += panel("All neighbours, at these positions", rate_a, rate_b, rate_bar, verdict(gap, gap_ci, nb if gap > 0 else na),
-                        f"{union:,} transmissions")
-    if one_sided and ex_union:
-        ex_bar = segbar([(sh["only_a"] / ex_union, "a", f"A only {100*sh['only_a']/ex_union:.0f}%"), (sh["pairs"] / ex_union, "n", f"both {100*sh['pairs']/ex_union:.0f}%"),
-                         (sh["only_b"] / ex_union, "b", f"B only {100*sh['only_b']/ex_union:.0f}%")],
-                        tip=f"shared neighbours only ({ex_union:,} transmissions)\nonly {na}: {sh['only_a']:,}\nboth: {sh['pairs']:,}\nonly {nb}: {sh['only_b']:,}")
-        panels += panel("Shared neighbours only", ex_rate_a, ex_rate_b, ex_bar, verdict(ex_gap, gap_ci, nb if ex_gap > 0 else na),
-                        f"{ex_union:,} transmissions · without ◐ {', '.join(esc(h) for h in R['one_sided'])}")
+    deep_ratio = max(fa["deep"], fb["deep"]) / max(1, min(fa["deep"], fb["deep"]))
+    deep_lead = nb if fb["deep"] > fa["deep"] else na
+    deep_verdict = (f"<b>{esc(deep_lead)} decodes {100*(deep_ratio-1):.0f}% more of the weakest packets</b>" if fa["deep"] + fb["deep"] >= 20 and deep_ratio >= 1.1
+                    else "<b>Level</b>" if fa["deep"] + fb["deep"] >= 20 else "")
     tiles = [
-        f'<div class="tile hero"><div class="l">Share of transmissions decoded</div><div class="halves">{panels}</div></div>' if union else tile("Share of transmissions decoded", "–"),
+        (f'<div class="tile hero"><div class="l">Share of transmissions decoded</div>'
+         f'<div class="v hero"><span class="ch a">A</span>{100*rate_a:.1f}%<span class="ch b">B</span>{100*rate_b:.1f}%</div>{rate_bar}'
+         f'<div class="verdict">{verdict(gap, gap_ci, nb if gap > 0 else na)}</div>'
+         f'<div class="note">{union:,} transmissions at least one node decoded, {npair:,} by both.</div></div>') if union else tile("Share of transmissions decoded", "–"),
+        (f'<div class="tile"><div class="l">Reaches deeper: packets decoded below {signed(DEEP_DB)} dB SNR</div>'
+         f'<div class="v"><span class="ch a">A</span>{fa["deep"]:,}<span class="ch b">B</span>{fb["deep"]:,}</div>'
+         f'<div class="verdict">{deep_verdict}</div>'
+         f'<div class="note">{fa["deep_pct"]:.0f}% / {fb["deep_pct"]:.0f}% of each node\'s packets · floor (5th pct) {signed(fa["snr_p5"], ".1f")} / {signed(fb["snr_p5"], ".1f")} dB '
+         f'· weakest {signed(fa["snr_min"], ".1f")} / {signed(fb["snr_min"], ".1f")} dB. Common SNR scale.</div></div>'),
         tile("SNR on the same packet, B − A", f"{signed(md, '.2f')} dB" if npair else "–",
              f"<b>{esc(lead)} reads higher</b> on {100*max(better_a, better_b)/npair:.0f}% of {npair:,} shared packets (CI ±{ci:.2f}). "
              f"Largely a reporting offset between the radios — diagnostic, not the outcome." if npair else ""),
-        tile(f"Decoded below {signed(DEEP_DB)} dB SNR",
-             f"<span class=\"ch a\">A</span>{fa['deep']:,}<span class=\"ch b\">B</span>{fb['deep']:,}",
-             (f"<b>{fa['deep_pct']:.0f}% / {fb['deep_pct']:.0f}%</b> of each node's packets"
-              + (f" · shared neighbours only <b>{ex_deep_a:,} / {ex_deep_b:,}</b>" if one_sided else "")
-              + f" · floor (5th pct) <b>{signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB</b>. Common SNR scale.")),
     ]
     def wins(x, y, higher_better=True):
         return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
