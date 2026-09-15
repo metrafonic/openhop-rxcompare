@@ -49,7 +49,9 @@ class Node:
         while True:
             d = self.get("bulk_packets", start_timestamp=start, end_timestamp=end, limit=PAGE, offset=offset)
             batch = d.get("data", [])
-            out.extend(batch)
+            # the node logs its own outgoing packets (adverts etc.) in the same table, with
+            # rssi 0 / snr 0 and drop_reason "No TX mode"; those were never received over the air
+            out.extend(p for p in batch if not (p.get("rssi") == 0 and p.get("snr") == 0))
             if len(batch) < PAGE:
                 return out
             offset += PAGE
