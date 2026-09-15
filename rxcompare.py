@@ -265,11 +265,12 @@ def print_report(R):
     print(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}  window: {time.strftime('%H:%M:%S', time.localtime(R['start']))} - now "
           f"({(R['end']-R['start'])/3600:.2f}h)   A={A['name']} ({A['url']})   B={B['name']} ({B['url']})")
     print("=" * 96)
-    print(f"{'':{W}}  {'packets':>8} {'matched':>8} {'only':>6} {'RSSI avg':>9} {'RSSI med':>9} "
+    union = len(pairs) + len(A["only"]) + len(B["only"])
+    print(f"{'':{W}}  {'packets':>8} {'decoded':>8} {'matched':>8} {'only':>6} {'RSSI avg':>9} {'RSSI med':>9} "
           f"{'SNR avg':>8} {'SNR med':>8} {'SNR min':>8} {f'<{DEEP_DB}dB':>7} {'noise avg':>10} {'noise min':>10} {'CRC err':>8}")
     for n in (A, B):
         nz = [v for _, v in n["noise"]]; fs = floor_stats(n)
-        print(f"{n['name']:{W}}  {n['n']:8d} {len(pairs):8d} {len(n['only']):6d} {fmt(mean(n['rssi']),9)} {fmt(med(n['rssi']),9)} "
+        print(f"{n['name']:{W}}  {n['n']:8d} {100*n['n']/union if union else NAN:7.1f}% {len(pairs):8d} {len(n['only']):6d} {fmt(mean(n['rssi']),9)} {fmt(med(n['rssi']),9)} "
               f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(fs['snr_min'],8,1)} {fs['deep']:7d} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
     print("-" * 96)
     if pairs:
@@ -347,7 +348,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .tile .l{color:var(--ink2);font-size:12px}.tile .v{font-size:26px;font-weight:600;line-height:1.2;margin:4px 0 2px}
-.tile .v.hero{font-size:38px}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
+.tile .v.hero{font-size:38px}.tile .v.hero .ch{font-size:15px;padding:5px 7px 4px;vertical-align:.35em}.tile .d b{color:var(--ink);font-weight:600}.tile .d{font-size:12px;color:var(--ink2)}.tile .d.good{color:var(--good)}.tile .d.bad{color:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;align-items:start}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:12px;align-items:start}
 .top{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}@media(min-width:860px){.top{grid-template-columns:1.5fr 1fr 1fr}}
@@ -944,13 +945,16 @@ def render_html(R, nav="", refresh=0):
                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm.")
     reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
+    lead_d = (nb if gap > 0 else na) if union else ""
     tiles = [
-        tile("Mean SNR advantage, B − A", f"{md:+.2f} dB" if npair else "–",
-             f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
-        tile("Decode rate of all transmissions seen",
+        tile("Decoded, of every transmission on the air",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             f"{rate_bar}{union:,} distinct transmissions, {npair:,} heard by both. Gap (B − A) {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts. {os_note}" if union else ""),
-        tile("Better SNR on the same packet",
+             (f"{rate_bar}" + (f"<b>{esc(lead_d)} decodes {100*abs(gap):.1f} pts more</b> (±{100*gap_ci:.1f}) of {union:,} transmissions. " if abs(gap) > gap_ci
+                                else f"Level within noise: gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts over {union:,} transmissions. ") + os_note) if union else "",
+             hero=True),
+        tile("SNR on the same packet, B − A", f"{signed(md, '.2f')} dB" if npair else "–",
+             f"{esc(lead)} reads cleaner on average; 95% CI ±{ci:.2f}, median {signed(med(dsnr), '.2f')} dB. Diagnostic, not the outcome." if npair else ""),
+        tile("Cleaner reading on the same packet",
              f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
              f"{snr_bar}{npair:,} matched packets; a tie is an identical SNR reading." if npair else ""),
     ]
@@ -959,6 +963,7 @@ def render_html(R, nav="", refresh=0):
     def wins(x, y, higher_better=True):
         return ("a" if (x > y) == higher_better else "b") if x == x and y == y and x != y else ""
     node_rows = "".join([
+        row("Decoded, of every transmission on the air", f"{100*rate_a:.1f}%", f"{100*rate_b:.1f}%", f"{union:,} distinct transmissions"),
         row("Packets decoded", f"{A['n']:,}", f"{B['n']:,}"),
         row("Heard only by this node", f"{len(A['only']):,}", f"{len(B['only']):,}", "packets the other node missed"),
         row("Average SNR of those", fmt(mean([p['snr'] for p in A['only']]),0,1)+" dB", fmt(mean([p['snr'] for p in B['only']]),0,1)+" dB", "low means the other node ran out of sensitivity; high means collisions or timing"),
@@ -1076,24 +1081,14 @@ def render_html(R, nav="", refresh=0):
 <h1 class="who"><span class="node a"><span class="chip">A</span>{esc(na)}</span><span class="vs">vs</span><span class="node b"><span class="chip">B</span>{esc(nb)}</span></h1>
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
 A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
-Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
-<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#matched">Matched</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
+Neither node transmits, so the share of the traffic each one decoded is a clean receive comparison; SNR on shared packets explains it. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
+<nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#matched">Matched</a><a href="#neighbours">Neighbours</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
 <section id="overview" class="first">
 <div class="top">{"".join(tiles)}</div>
 {reading_card}
 <h2 style="margin-top:22px">Per node</h2>
 {node_table}
-</section>
-
-<section id="matched">
-<h2>The same transmission, heard by both</h2>
-<p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
-{clock_note}
-<div class="grid2">
-<div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
-<div class="card"><h3>Δ SNR per packet, B − A</h3><p>Left of zero: {esc(na)} decoded the packet cleaner; right of zero: {esc(nb)} did. Bars are coloured by the winning node.</p>{chart_hist(dsnr, -8, 8, 1, '', h=360, marker=(md, f'mean {signed(md, ".2f")}'), sides=(na, nb))}</div>
-</div>
 </section>
 
 <section id="missed">
@@ -1112,6 +1107,16 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Each curve is on the reference node's own SNR scale, so the {signed(md, ".2f")} dB reading offset shifts one curve sideways relative to the other, and a single threshold-level neighbour heard from only one position can move a whole bin.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
 <div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
+</div>
+</section>
+
+<section id="matched">
+<h2>The same transmission, heard by both</h2>
+<p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
+{clock_note}
+<div class="grid2">
+<div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
+<div class="card"><h3>Δ SNR per packet, B − A</h3><p>Left of zero: {esc(na)} decoded the packet cleaner; right of zero: {esc(nb)} did. Bars are coloured by the winning node.</p>{chart_hist(dsnr, -8, 8, 1, '', h=360, marker=(md, f'mean {signed(md, ".2f")}'), sides=(na, nb))}</div>
 </div>
 </section>
 
