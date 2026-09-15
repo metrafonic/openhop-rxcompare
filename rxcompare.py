@@ -557,8 +557,10 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--ink2);font-weight:600
 #geo-map .geo-load{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--ink2);font-size:13px;text-align:center;padding:16px}
 #geo-map.leaflet-container{font:inherit;background:var(--plane)}
 /* tiles are desaturated so the only colour on the map is the data; MAP_GRAY=0 keeps the tiles' own colours */
-#geo-map .leaflet-tile-pane{opacity:.9}#geo-map.gray .leaflet-tile-pane{filter:grayscale(1) contrast(.9);opacity:.75}
-#geo-map.dark .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.85) saturate(.5)}#geo-map.dark.gray .leaflet-tile-pane{filter:grayscale(1) invert(1) brightness(.75) contrast(.8);opacity:.7}#geo-map svg{width:auto;height:auto;overflow:hidden}   /* the report's svg{width:100%} rule must not touch Leaflet's overlay */
+/* the filter goes on each tile image, never on the pane: a filtered pane is a new containing block and breaks Leaflet's panning */
+/* no per-tile opacity either: with any scaling it shows seams between tiles, so the wash-out is contrast/brightness */
+#geo-map.gray .leaflet-tile{filter:grayscale(1) contrast(.7) brightness(1.12)}
+#geo-map.dark .leaflet-tile{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.85) saturate(.5)}#geo-map.dark.gray .leaflet-tile{filter:grayscale(1) invert(1) brightness(.55) contrast(.75)}#geo-map svg{width:auto;height:auto;overflow:hidden}   /* the report's svg{width:100%} rule must not touch Leaflet's overlay */
 #geo-map .leaflet-control-attribution{background:color-mix(in srgb,var(--surface) 80%,transparent);color:var(--muted);font-size:10px}#geo-map .leaflet-control-attribution a{color:var(--ink2)}
 #geo-map .leaflet-bar{border:1px solid var(--border);box-shadow:none}#geo-map .leaflet-bar a{background:var(--surface);color:var(--ink);border-bottom-color:var(--grid)}
 #geo-map .leaflet-tooltip.geo-tip{background:var(--ink);color:var(--surface);border:0;box-shadow:none;border-radius:6px;padding:6px 8px;font-size:12px;line-height:1.45;white-space:pre}#geo-map .leaflet-tooltip.geo-tip:before{display:none}
@@ -678,7 +680,8 @@ function splitCircle(cx,cy,r,n){const A=tok('--a'),B=tok('--b'),surf=tok('--surf
   if(n.os)s+=`<circle cx="${cx}" cy="${cy}" r="${r+4}" fill="none" stroke="var(--ink)" stroke-width="1"/>`;
   return s}
 const gradient=n=>{const f=(100*frac(n)).toFixed(0);return `linear-gradient(to right,${tok('--a')} ${f}%,${tok('--b')} ${f}%)`};
-const rings=n=>{const w=winner(n),ring=w?`,0 0 0 3px ${tok(w==='a'?'--a':'--b')}`:'';return `0 0 0 1px ${tok('--surface')}${ring}${n.os?`,0 0 0 ${w?4:2}px ${tok('--ink')}`:''}`};
+// on the map a level neighbour gets no outline at all: the surface hairline only separates the fill from a winner's ring
+const rings=n=>{const w=winner(n);let r=[];if(w)r.push(`0 0 0 1px ${tok('--surface')}`,`0 0 0 3px ${tok(w==='a'?'--a':'--b')}`);if(n.os)r.push(`0 0 0 ${w?4:1}px ${tok('--ink')}`);return r.join(',')||'none'};
 const size=pk=>4+9*Math.sqrt(pk/NMAX), evid=pk=>.18+.5*Math.sqrt(pk/NMAX);
 const tipFor=n=>`${n.hop}${n.name?' · '+n.name:''}\n${compass(n.brg)} ${Math.round(n.brg)}° · ${two?`A ${fmtKm(n.da)} / B ${fmtKm(n.db)}`:fmtKm(n.d)}\n${n.pk} packets · heard by A ${pct(n.ra)} · B ${pct(n.rb)}\nSNR on matched  A ${db(n.sa)} · B ${db(n.sb)} dB${n.os?'\n◐ one-sided: heard from one position only':''}`;
 const pick=hop=>{picked=picked===hop?null:hop;render();
@@ -725,7 +728,7 @@ function loadMap(){
   const css=document.createElement('link');css.rel='stylesheet';css.href='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css';document.head.appendChild(css);
   const js=document.createElement('script');js.src='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
   let pending=2;const ready=()=>{if(--pending)return;mapState='ready';box.innerHTML='';box.classList.toggle('dark',isDark());box.classList.toggle('gray',!!G.map_gray);
-    map=L.map(box,{zoomSnap:.5}).setView(G.mid,10);
+    map=L.map(box).setView(G.mid,10);
     L.tileLayer(G.tiles,{maxZoom:17,attribution:G.attrib}).addTo(map);
     layer=L.layerGroup().addTo(map);
     map.fitBounds(L.latLngBounds([G.a,G.b,...N.map(n=>n.ll)]).pad(.06));
