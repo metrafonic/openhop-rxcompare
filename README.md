@@ -9,7 +9,12 @@ side, both in no-TX mode.
 It pulls packet history from each node's openHop API, joins the packets that both nodes
 heard (same `packet_hash` + `path_hash` within 3 s), and reports:
 
-- **decode rate**: of every transmission at least one node heard, the share each node decoded
+- **decode rate**: of every transmission at least one node heard, the share each node decoded,
+  with a paired confidence interval and the same rate without *one-sided neighbours* (hops one
+  antenna hears and the other barely does — placement, not receiver)
+- a **Reading** card that turns the headline numbers into a few sentences: who decodes more,
+  whether the SNR offset is flat across levels (reporting) or not (real), who reaches deeper,
+  and which neighbours are one-sided
 - **SNR advantage** per packet (with a confidence interval), per upstream neighbour and over
   time (the fair metric — RSSI is calibrated differently per radio and is shown but flagged as such)
 - packets **only one node** decoded: how weak they were (sensitivity vs. collisions) and

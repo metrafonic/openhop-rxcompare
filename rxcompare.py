@@ -359,7 +359,7 @@ h1.who{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 22px;margin:0 0
 @media(max-width:700px){.nodes td:last-child,.nodes th:last-child{display:none}.nodes{table-layout:fixed}.nodes td,.nodes th{width:auto}.nodes th:first-child{width:42%}.nodes td{white-space:normal}.nodes td:nth-child(2),.nodes td:nth-child(3){padding-left:10px}}
 .nodes .sw{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}
-.card h3{font-size:13px;font-weight:600;margin:0 0 2px}.card p{margin:0 0 8px;color:var(--ink2);font-size:12px}.card .legend{margin:0 0 8px;font-size:12px}
+.card h3{font-size:13px;font-weight:600;margin:0 0 2px}.card p{margin:0 0 8px;color:var(--ink2);font-size:12px}.reading{margin-top:12px}.reading ul{margin:6px 0 0;padding-left:18px;color:var(--ink2);font-size:13px;line-height:1.5}.reading li{margin:3px 0}.reading b{color:var(--ink)}.card .legend{margin:0 0 8px;font-size:12px}
 svg{display:block;width:100%;height:auto;overflow:visible}
 .ax text{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.ax line{stroke:var(--grid)}.ax .base{stroke:var(--axis)}
 .lbl{fill:var(--ink2);font-size:11px}
@@ -666,7 +666,7 @@ def chart_type_rates(by_type, na, nb, min_n=10):
     if not rows:
         return "<p>not enough packets yet</p>"
     rh = 26
-    s = Svg(w=520, h=rh * len(rows) + 40, ml=118, mr=96, mt=8, mb=26)
+    s = Svg(w=520, h=rh * len(rows) + 40, ml=150, mr=96, mt=8, mb=26)
     s.scales(0, 1.0, 0, len(rows))
     s.axes([0, .25, .5, .75, 1], [], xfmt=lambda t: f"{100*t:.0f}%", y0=False)
     for i, t in enumerate(rows):
@@ -678,7 +678,7 @@ def chart_type_rates(by_type, na, nb, min_n=10):
         s.add(f'<rect class="hit" x="{s.ml}" y="{y-3}" width="{s.w-s.ml-s.mr}" height="{rh}" data-tip="{esc(t["name"])} · {t["n"]} transmissions, avg {t["len"]:.0f} B\n'
               f'{esc(na)} decoded {t["both"]+t["a"]} ({100*ra:.0f}%)\n{esc(nb)} decoded {t["both"]+t["b"]} ({100*rb:.0f}%)"/>')
         s.add(f'<text x="{s.ml-8}" y="{y+13}" text-anchor="end" fill="var(--ink2)" font-size="11">{esc(t["name"])}</text>')
-        s.add(f'<text x="{s.ml-8-66}" y="{y+13}" text-anchor="end" fill="var(--muted)" font-size="10">{t["len"]:.0f} B</text>')
+        s.add(f'<text x="{s.ml-8-66}" y="{y+13}" text-anchor="end" fill="var(--muted)" font-size="10">n={t["n"]} · {t["len"]:.0f} B</text>')
         gap = rb - ra
         s.add(f'<text x="{s.w-s.mr+8}" y="{y+13}" fill="var(--ink2)" font-size="11" font-variant-numeric="tabular-nums">'
               f'<tspan fill="var(--a)">{100*ra:.0f}</tspan><tspan fill="var(--muted)"> / </tspan><tspan fill="var(--b)">{100*rb:.0f}</tspan>'
@@ -881,12 +881,74 @@ def render_html(R, nav="", refresh=0):
                       tip=f"only {na}: {oa:,} ({100*oa/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {nb}: {ob:,} ({100*ob/union:.1f}%)") if union else ""
     snr_bar = segbar([(better_a / npair, "a", f"A {100*better_a/npair:.0f}%"), (ties / npair, "n", f"tie {100*ties/npair:.0f}%"), (better_b / npair, "b", f"B {100*better_b/npair:.0f}%")],
                      tip=f"{na} better: {better_a:,}\ntie: {ties:,}\n{nb} better: {better_b:,}") if npair else ""
+    # neighbours one antenna hears and the other barely does: placement, not receiver, and they move every
+    # sensitivity number. Report the decode rate without them alongside the full one.
+    def heard(n):
+        u = n["both"] + n["a"] + n["b"]
+        return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
+    one_sided = [n for n in R["neighbours"] if n["both"] + n["a"] + n["b"] >= 20 and min(heard(n)) < 0.5 and max(heard(n)) > 0.85]
+    os_hops = {n["hop"] for n in one_sided}
+    ex_pairs = sum(1 for p, _ in pairs if hopname(p) not in os_hops)
+    ex_a = sum(1 for p in A["only"] if hopname(p) not in os_hops); ex_b = sum(1 for q in B["only"] if hopname(q) not in os_hops)
+    ex_union = ex_pairs + ex_a + ex_b
+    ex_rate_a = (ex_pairs + ex_a) / ex_union if ex_union else NAN; ex_rate_b = (ex_pairs + ex_b) / ex_union if ex_union else NAN
+    ex_gap = ex_rate_b - ex_rate_a
+    ex_deep_a = sum(1 for p, _ in pairs if p["snr"] < DEEP_DB and hopname(p) not in os_hops) + sum(1 for p in A["only"] if p["snr"] < DEEP_DB and hopname(p) not in os_hops)
+    ex_deep_b = sum(1 for _, q in pairs if q["snr"] < DEEP_DB and hopname(q) not in os_hops) + sum(1 for q in B["only"] if q["snr"] < DEEP_DB and hopname(q) not in os_hops)
+    os_note = (f"Without {', '.join(esc(n['hop']) for n in one_sided)}: "
+               f"<span class=\"ch a\">A</span>{100*ex_rate_a:.1f}% <span class=\"ch b\">B</span>{100*ex_rate_b:.1f}%." if one_sided else "")
+
+    # ---- the reading: a few sentences derived from the numbers, so the tiles don't contradict each other unexplained
+    reading = []
+    if union:
+        lead_r, lag_r = (nb, na) if gap > 0 else (na, nb)
+        if one_sided and (ex_gap > 0) != (gap > 0) and abs(ex_gap) > gap_ci:
+            tail = f", but <b>the lead reverses</b> without the one-sided neighbours: {esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%."
+        elif one_sided and abs(ex_gap) <= gap_ci:
+            tail = f", but without the one-sided neighbours the two are level ({esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%)."
+        elif one_sided:
+            tail = f"; {100*ex_rate_a:.1f}% vs {100*ex_rate_b:.1f}% without the one-sided neighbours."
+        else:
+            tail = "."
+        if abs(gap) > gap_ci:
+            reading.append(f"<b>{esc(lead_r)} decoded {100*abs(gap):.1f} pts more</b> of the {union:,} transmissions on the air (±{100*gap_ci:.1f}){tail}")
+        else:
+            reading.append(f"<b>Both decoded the same share</b> of the {union:,} transmissions, within noise (gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts).")
+    if npair:
+        reader = nb if md > 0 else na
+        lv = [r["mean"] for r in R["dsnr_by_level"] if r["n"] >= 30]
+        spread = max(lv) - min(lv) if len(lv) > 1 else NAN
+        if spread == spread and spread < 1.0:
+            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>, and the offset is the same at every signal level (spread {spread:.1f} dB) — "
+                           f"a reporting difference between the radios more than a receive difference.")
+        elif spread == spread:
+            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>, but the offset changes with level (spread {spread:.1f} dB), so part of it is real.")
+        else:
+            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>.")
+    if fa["deep"] + fb["deep"] >= 20:
+        hi, lo = (fb, fa) if fb["deep"] > fa["deep"] else (fa, fb)
+        hn, ln = (nb, na) if fb["deep"] > fa["deep"] else (na, nb)
+        ex_hi, ex_lo = (ex_deep_b, ex_deep_a) if hn == nb else (ex_deep_a, ex_deep_b)
+        ex_tail = (f" Without the one-sided neighbours it is {ex_hi:,} against {ex_lo:,}"
+                   + (", so most of that depth is those neighbours." if ex_hi < 1.25 * max(1, ex_lo) else ".")) if one_sided else ""
+        if hi["deep"] >= 1.25 * max(1, lo["deep"]):
+            reading.append(f"<b>{esc(hn)} reaches deeper</b>: {hi['deep']:,} packets decoded below {signed(DEEP_DB)} dB against {lo['deep']:,}, "
+                           f"weakest {signed(hi['snr_min'], '.1f')} vs {signed(lo['snr_min'], '.1f')} dB.{ex_tail}")
+        else:
+            reading.append(f"Both reach about the same floor: {fa['deep']:,} / {fb['deep']:,} packets below {signed(DEEP_DB)} dB, weakest {signed(fa['snr_min'], '.1f')} / {signed(fb['snr_min'], '.1f')} dB.")
+    if one_sided:
+        who = lambda n: na if heard(n)[0] > heard(n)[1] else nb
+        reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
+                       + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard(n)):.0f}% vs {100*min(heard(n)):.0f}%)" for n in one_sided)
+                       + ". That is antenna placement or pattern, not the receiver; swap antennas to tell which.")
+    reading_card = f'<div class="card reading"><h3>Reading</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
+
     tiles = [
         tile("Mean SNR advantage, B − A", f"{md:+.2f} dB" if npair else "–",
              f"{esc(lead)} decodes cleaner on average. 95% CI ±{ci:.2f}, median {med(dsnr):+.2f} dB." if npair else "", hero=True),
         tile("Decode rate of all transmissions seen",
              f"<span class=\"ch a\">A</span>{100*rate_a:.1f}%<span class=\"ch b\">B</span>{100*rate_b:.1f}%" if union else "–",
-             f"{rate_bar}{union:,} distinct transmissions, {npair:,} heard by both. Gap (B − A) {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts." if union else ""),
+             f"{rate_bar}{union:,} distinct transmissions, {npair:,} heard by both. Gap (B − A) {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts. {os_note}" if union else ""),
         tile("Better SNR on the same packet",
              f"<span class=\"ch a\">A</span>{100*better_a/npair:.0f}%<span class=\"ch b\">B</span>{100*better_b/npair:.0f}%" if npair else "–",
              f"{snr_bar}{npair:,} matched packets; a tie is an identical SNR reading." if npair else ""),
@@ -1018,6 +1080,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 
 <section id="overview" class="first">
 <div class="top">{"".join(tiles)}</div>
+{reading_card}
 <h2 style="margin-top:22px">Per node</h2>
 {node_table}
 </section>
@@ -1129,7 +1192,11 @@ def summary(R):
                 "noise_avg": mean([v for _, v in n["noise"]]), "crc_errors": n["crc"],
                 **floor_stats(n)}
     union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
-    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
+    def heard(n):
+        u = n["both"] + n["a"] + n["b"]
+        return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
+    one_sided = [n["hop"] for n in R["neighbours"] if n["both"] + n["a"] + n["b"] >= 20 and min(heard(n)) < 0.5 and max(heard(n)) > 0.85]
+    d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union, "one_sided_neighbours": one_sided,
          "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),
