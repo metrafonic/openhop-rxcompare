@@ -614,13 +614,17 @@ def chart_decode_curve(curves, na, nb, step=2, min_n=5):
         for k, col, who, ref in series:
             c = next((c for c in pts[k] if c["snr"] == x), None)
             if c:
-                tip.append(f"{ref} heard {c['seen']} at that level · {who} also decoded {c['decoded']} ({100*c['decoded']/c['seen']:.0f}%)")
+                pr = c["decoded"] / c["seen"]; ci = 1.96 * math.sqrt(pr * (1 - pr) / c["seen"])
+                tip.append(f"{ref} heard {c['seen']} at that level · {who} also decoded {c['decoded']} ({100*pr:.0f}% ±{100*ci:.0f})")
         cx = s.x(x + step / 2)
         s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" data-tip="{esc(chr(10).join(tip))}"/>')
         for k, col, who, ref in series:
             c = next((c for c in pts[k] if c["snr"] == x), None)
             if c:
-                s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{s.y(c["decoded"]/c["seen"]):.1f}" r="{3 + min(2, math.log10(c["seen"])):.1f}" fill="{col}" '
+                pr = c["decoded"] / c["seen"]; ci = 1.96 * math.sqrt(pr * (1 - pr) / c["seen"])
+                y1, y2 = s.y(max(0, pr - ci)), s.y(min(1, pr + ci))
+                s.add(f'<path d="M{cx:.1f},{y1:.1f}V{y2:.1f}M{cx-3:.1f},{y1:.1f}h6M{cx-3:.1f},{y2:.1f}h6" stroke="{col}" stroke-width="1.5" fill="none" pointer-events="none"/>')
+                s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{s.y(pr):.1f}" r="{3 + min(2, math.log10(c["seen"])):.1f}" fill="{col}" '
                       f'stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
     return s.render()
 
@@ -1041,7 +1045,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <h2>Sensitivity or collisions?</h2>
 <p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air.</p>
 <div class="grid2">
-<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Each curve is on the reference node's own SNR scale. The cliff is the sensitivity floor.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Chance the other node decoded it too</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Each curve is on the reference node's own SNR scale, so the {signed(md, ".2f")} dB reading offset shifts one curve sideways relative to the other, and a single threshold-level neighbour heard by one antenna can move a whole bin.</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
 <div class="card"><h3>Δ SNR by signal level, B − A</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>
