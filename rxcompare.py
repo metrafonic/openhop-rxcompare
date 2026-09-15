@@ -407,6 +407,11 @@ def esc(s):
     return html.escape(str(s), quote=True)
 
 
+def signed(v, fmt="g"):
+    """Signed number with a typographic minus, so −1 reads as clearly as +1 on an axis."""
+    return "0" if v == 0 else f"{v:+{fmt}}".replace("-", "−")
+
+
 def nice_ticks(lo, hi, n=5):
     if hi <= lo:
         hi = lo + 1
@@ -460,35 +465,43 @@ class Svg:
         return f'<svg viewBox="0 0 {self.w} {self.h}" xmlns="http://www.w3.org/2000/svg">{"".join(self.parts)}</svg>'
 
 
-def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--a)", clamp=True, h=240, marker=None):
-    """Single-series histogram. `values` binned into [lo,hi] by `step`; ends clamped.
-    `marker=(value, label)` draws a vertical reference line."""
+def chart_hist(values, lo, hi, step, title, unit="dB", color="var(--ink2)", clamp=True, h=240, marker=None, sides=None):
+    """Single-series histogram. Each bin is centred on a multiple of `step` (so the 0 bin is
+    symmetric around zero) and the ends are clamped to [lo,hi]. `marker=(value, label)` draws a
+    vertical reference line. `sides=(left, right)` colours negative bins A and positive bins B and
+    labels which node each side favours."""
     if not values:
         return "<p>no data</p>"
     bins = defaultdict(int)
     for v in values:
-        b = math.floor(v / step) * step
+        b = round(v / step) * step
         if clamp:
             b = max(lo, min(hi, b))
         bins[round(b, 6)] += 1
     xs = sorted(bins)
-    s = Svg(h=h)
-    s.scales(lo - step / 2, hi + step * 1.5, 0, max(bins.values()) * 1.08)
-    s.axes([x for x in xs if int(round(x / step)) % (2 if step < 1 else 1) == 0], nice_ticks(0, max(bins.values())),
-           xfmt=lambda t: f"{t:+g}" if t else "0")
+    s = Svg(h=h, mb=42 if sides else 28)
+    s.scales(lo - step, hi + step, 0, max(bins.values()) * 1.08)
+    s.axes([x for x in xs if int(round(x / step)) % (2 if step < 1 else 1) == 0], nice_ticks(0, max(bins.values())), xfmt=signed)
     bw = max(2, min(24, (s.x(step) - s.x(0)) - 2))
     total = len(values)
     for x in xs:
         n = bins[x]
-        cx = s.x(x + step / 2); top = s.y(n); base = s.y(0)
+        cx = s.x(x); top = s.y(n); base = s.y(0)
         r = min(4, bw / 2, (base - top))
-        lbl = ("≤" if clamp and x == lo else "≥" if clamp and x == hi else "") + f"{x:+g}"
+        edge = "≤" if clamp and x == lo else "≥" if clamp and x == hi else ""
+        rng = f" ({signed(x - step / 2)}…{signed(x + step / 2)})" if not edge else ""
+        col = color if not sides or x == 0 else "var(--a)" if x < 0 else "var(--b)"
         s.add(f'<rect class="hit" x="{cx-bw/2-1:.1f}" y="{s.mt}" width="{bw+2:.1f}" height="{s.h-s.mt-s.mb}" '
-              f'data-tip="{lbl} {unit}: {n} packets ({100*n/total:.0f}%)"/>')
-        s.add(f'<path class="mark" fill="{color}" d="M{cx-bw/2:.1f},{base:.1f}V{top+r:.1f}q0,-{r} {r},-{r}h{bw-2*r:.1f}q{r},0 {r},{r}V{base:.1f}Z"/>')
+              f'data-tip="Δ {edge}{signed(x)} {unit}{rng}: {n} packets ({100*n/total:.0f}%)"/>')
+        s.add(f'<path class="mark" fill="{col}" d="M{cx-bw/2:.1f},{base:.1f}V{top+r:.1f}q0,-{r} {r},-{r}h{bw-2*r:.1f}q{r},0 {r},{r}V{base:.1f}Z"/>')
+    if sides:
+        left, right = sides
+        y = s.h - 6
+        s.add(f'<text class="lbl" x="{s.ml}" y="{y}" fill="var(--a)">← {esc(left)} cleaner</text>'
+              f'<text class="lbl" x="{s.w-s.mr}" y="{y}" text-anchor="end" fill="var(--b)">{esc(right)} cleaner →</text>')
     if marker:
         mv, ml = marker
-        mx = s.x(mv + step / 2)
+        mx = s.x(mv)
         s.add(f'<line x1="{mx:.1f}" x2="{mx:.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--ink)" stroke-width="1.5"/>'
               f'<text class="lbl" x="{mx+6:.1f}" y="{s.mt+12}" fill="var(--ink)">{esc(ml)}</text>')
     return s.render()
@@ -532,7 +545,7 @@ def chart_dumbbell(neigh, na, nb):
     rh = 20
     s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
     s.scales(lo, hi, 0, len(rows))
-    s.axes(nice_ticks(lo, hi, 6), [], xfmt=lambda t: f"{t:+g}" if t else "0", y0=False)
+    s.axes(nice_ticks(lo, hi, 6), [], xfmt=signed, y0=False)
     if lo < 0 < hi:
         s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
     for i, n in enumerate(rows):
@@ -562,7 +575,7 @@ def chart_hist2(va, vb, lo, hi, step, na, nb, unit="dB"):
     mx = max(list(ba.values()) + list(bb.values()) + [1])
     s = Svg()
     s.scales(lo - step / 2, hi + step * 1.5, 0, mx * 1.08)
-    s.axes([x for x in xs if int(x / step) % 2 == 0], nice_ticks(0, mx), xfmt=lambda t: f"{t:+g}" if t else "0")
+    s.axes([x for x in xs if int(x / step) % 2 == 0], nice_ticks(0, mx), xfmt=signed)
     slot = s.x(step) - s.x(0)
     bw = max(2, min(12, (slot - 4) / 2))
     for x in xs:
@@ -573,7 +586,7 @@ def chart_hist2(va, vb, lo, hi, step, na, nb, unit="dB"):
             cx = s.x(x + step / 2) + (i - 0.5) * (bw + 2)
             top, base = s.y(n), s.y(0); r = min(4, bw / 2, base - top)
             s.add(f'<rect class="hit" x="{cx-bw/2-1:.1f}" y="{s.mt}" width="{bw+2:.1f}" height="{s.h-s.mt-s.mb}" '
-                  f'data-tip="only {name}\\nSNR {x:+g}…{x+step:+g} {unit}: {n}"/>')
+                  f'data-tip="only {name}\\nSNR {signed(x)}…{signed(x+step)} {unit}: {n}"/>')
             s.add(f'<path class="mark" fill="{col}" d="M{cx-bw/2:.1f},{base:.1f}V{top+r:.1f}q0,-{r} {r},-{r}h{bw-2*r:.1f}q{r},0 {r},{r}V{base:.1f}Z"/>')
     return s.render()
 
@@ -651,7 +664,7 @@ def chart_neighbours(neigh, na, nb):
     rh = 20
     s = Svg(w=520, h=rh * len(rows) + 40, ml=70, mr=16, mt=8, mb=26)
     s.scales(-mx * 1.15, mx * 1.15, 0, len(rows))
-    s.axes(nice_ticks(-mx, mx, 6), [], xfmt=lambda t: f"{t:+g}" if t else "0", y0=False)
+    s.axes(nice_ticks(-mx, mx, 6), [], xfmt=signed, y0=False)
     s.add(f'<line x1="{s.x(0):.1f}" x2="{s.x(0):.1f}" y1="{s.mt}" y2="{s.h-s.mb}" stroke="var(--axis)"/>')
     for i, n in enumerate(rows):
         y = s.mt + i * rh + 4
@@ -836,7 +849,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <p class="meta">{npair:,} transmissions decoded by both nodes. This is the like-for-like comparison.</p>
 <div class="grid2">
 <div class="card"><h3>SNR: {esc(na)} vs {esc(nb)}</h3><p>Each dot is one transmission. Above the diagonal means {esc(nb)} decoded it cleaner. Dot size grows with overplotting.</p>{chart_scatter(A['snr'], B['snr'], na, nb, 'dB', meta)}</div>
-<div class="card"><h3>Δ SNR per packet, B − A</h3><p>Positive means {esc(nb)} decoded it cleaner.</p>{chart_hist(dsnr, -8, 8, 1, '', color='var(--ink2)', h=360, marker=(md, f'mean {md:+.2f}'))}</div>
+<div class="card"><h3>Δ SNR per packet, B − A</h3><p>Left of zero: {esc(na)} decoded the packet cleaner; right of zero: {esc(nb)} did. Bars are coloured by the winning node.</p>{chart_hist(dsnr, -8, 8, 1, '', h=360, marker=(md, f'mean {signed(md, ".2f")}'), sides=(na, nb))}</div>
 </div>
 </section>
 
@@ -884,7 +897,7 @@ Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <details><summary>RSSI calibration check: why the report compares SNR, not RSSI</summary>
 <div class="grid2" style="margin-top:10px">
 <div class="card"><h3>RSSI: {esc(na)} vs {esc(nb)}</h3><p>A bend away from the diagonal means the two radios report RSSI on different calibration curves.</p>{chart_scatter(A['rssi'], B['rssi'], na, nb, 'dBm', meta)}</div>
-<div class="card"><h3>Δ RSSI per packet, B − A</h3><p>A bimodal shape here is a calibration artefact, not antenna gain. Mean {mean(drssi):+.2f} dB.</p>{chart_hist(drssi, -10, 10, 1, '', color='var(--ink2)', h=360)}</div>
+<div class="card"><h3>Δ RSSI per packet, B − A</h3><p>A bimodal shape here is a calibration artefact, not antenna gain. Mean {mean(drssi):+.2f} dB.</p>{chart_hist(drssi, -10, 10, 1, '', h=360)}</div>
 </div></details>
 <details open><summary>Per-neighbour table ({len(R['neighbours'])} rows)</summary>
 <div class="card wrap"><table><thead><tr><th>last hop</th><th>both</th><th>only {esc(na)}</th><th>only {esc(nb)}</th>
