@@ -2,8 +2,10 @@
 """Compare RX performance of two openHop repeaters listening on the same channel.
 
 Joins packets seen on both nodes by (packet_hash, path_hash, timestamp within
-a few seconds) and reports RSSI/SNR deltas, packets heard by only one node,
-per-neighbour breakdown, noise floor and CRC errors.
+a few seconds) and reports the share of the traffic each node decoded, SNR deltas,
+packets heard by only one node, per-neighbour breakdown, noise floor and CRC errors.
+Each node's own transmissions (none in no-TX mode, a few in monitor mode) are left
+out on both sides.
 
 Usage:
   ./rxcompare.py                       # last hour, text report
@@ -54,17 +56,27 @@ class Node:
             return json.load(r)
 
     def packets(self, start, end):
-        out, offset = [], 0
+        """(received, own). Packets the node originated itself — its adverts, openHop's own requests and
+        path replies, a companion app's traffic — land in the same table as receptions, with rssi 0 (the
+        SNR there is not a measurement: some builds log 0, others a fixed ~12.5) and, in no-TX mode,
+        drop_reason "No TX mode". They were never received here, so they are kept apart; the ones the
+        node did send (`transmitted`) matter to the other side, see analyze()."""
+        out, own, offset = [], [], 0
         while True:
             d = self.get("bulk_packets", start_timestamp=start, end_timestamp=end, limit=PAGE, offset=offset)
             batch = d.get("data", [])
-            # packets queued for transmission (the node's own, or a companion app's adverts and
-            # requests sent through it) land in the same table with rssi 0 / snr 0 and, in no-TX
-            # mode, drop_reason "No TX mode"; they were never on the air, so they are not RX data
-            out.extend(p for p in batch if not (p.get("rssi") == 0 and p.get("snr") == 0))
+            for p in batch:
+                (own if p.get("transmitted") or p.get("rssi") == 0 else out).append(p)
             if len(batch) < PAGE:
-                return out
+                return out, own
             offset += PAGE
+
+    def mode(self):
+        """openHop's repeater mode ("no_tx", "monitor", "normal", …), or None on builds without it."""
+        try:
+            return self.get("stats")["config"]["repeater"]["mode"]
+        except Exception:
+            return None
 
     def noise(self, hours):
         h = self.get("noise_floor_history", hours=hours)["data"]["history"]
@@ -262,10 +274,27 @@ def med(xs):
 def analyze(A, B, hours):
     end = time.time()
     start = end - hours * 3600
-    pa, pb = A.packets(start, end), B.packets(start, end)
-    # ignore our own transmissions (should be none in no-tx mode, but be safe)
-    pa = [p for p in pa if not p.get("transmitted")]
-    pb = [p for p in pb if not p.get("transmitted")]
+    (pa, own_a), (pb, own_b) = A.packets(start, end), B.packets(start, end)
+    # In no-TX mode nothing is sent. In monitor mode a node still sends its own adverts and openHop's
+    # requests now and then; the other node hears those straight off its antenna and would book each one
+    # as a miss for the sender. Drop them there too: same packet hash within the match window, no upstream
+    # hop (a copy relayed by a real neighbour arrives later, with that neighbour as upstream, and counts).
+    tx_a = [p for p in own_a if p.get("transmitted")]; tx_b = [q for q in own_b if q.get("transmitted")]
+    def strip_sent_by_other(px, sent):
+        at = defaultdict(list)
+        for q in sent:
+            at[q.get("packet_hash")].append(q["timestamp"])
+        keep, heard = [], 0
+        for p in px:
+            if p.get("upstream_hash") is None and any(abs(p["timestamp"] - t) < MATCH_WINDOW_S for t in at.get(p.get("packet_hash"), ())):
+                heard += 1
+            else:
+                keep.append(p)
+        return keep, heard
+    pa, heard_a = strip_sent_by_other(pa, tx_b)   # heard_a: B's transmissions A picked up
+    pb, heard_b = strip_sent_by_other(pb, tx_a)
+    tx = {"A": {"mode": A.mode(), "sent": len(tx_a), "heard_by_other": heard_b},
+          "B": {"mode": B.mode(), "sent": len(tx_b), "heard_by_other": heard_a}}
     # only compare the period where both nodes were actually listening
     if pa and pb:
         overlap = max(min(p["timestamp"] for p in pa), min(p["timestamp"] for p in pb))
@@ -407,7 +436,7 @@ def analyze(A, B, hours):
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
-        "one_sided": one_sided, "geo": geo, "canon": canon,
+        "one_sided": one_sided, "geo": geo, "canon": canon, "tx": tx,
         "shared": {"pairs": len(sh_pairs), "only_a": len(sh_only_a), "only_b": len(sh_only_b),
                    "deep_a": sum(1 for p, _ in sh_pairs if p["snr"] + shift["a"] < DEEP_DB) + sum(1 for p in sh_only_a if p["snr"] + shift["a"] < DEEP_DB),
                    "deep_b": sum(1 for _, q in sh_pairs if q["snr"] + shift["b"] < DEEP_DB) + sum(1 for q in sh_only_b if q["snr"] + shift["b"] < DEEP_DB)},
@@ -421,48 +450,89 @@ def fmt(x, w=6, d=1):
     return f"{x:{w}.{d}f}" if x == x else " " * (w - 1) + "-"
 
 
+def wrap(s, indent=4, width=96):
+    import textwrap
+    return textwrap.fill(s, width=width, initial_indent=" " * indent, subsequent_indent=" " * (indent + 2))
+
+
 def print_report(R):
     A, B, pairs = R["A"], R["B"], R["pairs"]
+    na, nb = A["name"], B["name"]
     drssi, dsnr = R["drssi"], R["dsnr"]
-    W = max(len(A["name"]), len(B["name"]), 8)
+    W = max(len(na), len(nb), 8)
+    H = headline(R)
+    union, gap, gap_ci = H["union"], H["gap"], H["gap_ci"]
     print(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}  window: {time.strftime('%H:%M:%S', time.localtime(R['start']))} - now "
-          f"({(R['end']-R['start'])/3600:.2f}h)   A={A['name']} ({A['url']})   B={B['name']} ({B['url']})")
+          f"({(R['end']-R['start'])/3600:.2f}h)   A={na} ({A['url']})   B={nb} ({B['url']})")
     print("=" * 96)
-    union = len(pairs) + len(A["only"]) + len(B["only"])
+    # the headline: of everything on the air, the share each node decoded, and what it adds up to
+    if union:
+        lead = nb if gap > 0 else na
+        verdict = f"{lead} +{100*abs(gap):.1f} pts (±{100*gap_ci:.1f})" if abs(gap) > gap_ci else f"level (gap {100*gap:+.1f} ±{100*gap_ci:.1f})"
+        print(f"Decoded, of {union:,} transmissions on the air:  {na} {100*H['rate_a']:.1f}%   {nb} {100*H['rate_b']:.1f}%   -> {verdict}")
+        if H["one_sided"]:
+            print(f"  without one-sided neighbours ({', '.join(n['hop'] for n in H['one_sided'])}):  "
+                  f"{na} {100*H['ex_rate_a']:.1f}%   {nb} {100*H['ex_rate_b']:.1f}%   ({H['ex_union']:,} transmissions)")
+    print(wrap(strip_tags(tx_note(R)[0]), indent=2))
+    reading = build_reading(R, H)
+    if reading:
+        print("Reading:")
+        for r in reading:
+            print(wrap("- " + strip_tags(r), indent=2))
+    print("-" * 96)
     print(f"{'':{W}}  {'packets':>8} {'decoded':>8} {'matched':>8} {'only':>6} {'RSSI avg':>9} {'RSSI med':>9} "
           f"{'SNR avg':>8} {'SNR med':>8} {'SNR min':>8} {f'<{DEEP_DB}dB':>7} {'noise avg':>10} {'noise min':>10} {'CRC err':>8}")
     for n in (A, B):
         nz = [v for _, v in n["noise"]]; fs = floor_stats(n, R["snr_shift"]["a" if n is A else "b"])
         print(f"{n['name']:{W}}  {n['n']:8d} {100*n['n']/union if union else NAN:7.1f}% {len(pairs):8d} {len(n['only']):6d} {fmt(mean(n['rssi']),9)} {fmt(med(n['rssi']),9)} "
               f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(fs['snr_min'],8,1)} {fs['deep']:7d} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
+    print("  decoded = share of every transmission at least one node heard. SNR min and <-8dB are on the common SNR scale.")
+    print("  RSSI and noise floor are calibrated differently per radio: compare SNR, not RSSI.")
     print("-" * 96)
     if pairs:
-        better_b = sum(1 for d in drssi if d > 0); better_a = sum(1 for d in drssi if d < 0)
+        better_b = sum(1 for d in dsnr if d > 0); better_a = sum(1 for d in dsnr if d < 0)
         print(f"Delta (B - A) over {len(pairs)} matched packets:")
-        print(f"  RSSI: mean {mean(drssi):+.2f} dB  median {med(drssi):+.1f}  "
-              f"stdev {st.pstdev(drssi):.2f}  min {min(drssi):+d}  max {max(drssi):+d}")
         print(f"  SNR : mean {mean(dsnr):+.2f} dB  median {med(dsnr):+.2f}  "
-              f"stdev {st.pstdev(dsnr):.2f}  min {min(dsnr):+.2f}  max {max(dsnr):+.2f}")
-        print(f"  RSSI better on A: {better_a} ({100*better_a/len(pairs):.0f}%)   "
+              f"stdev {st.pstdev(dsnr):.2f}  min {min(dsnr):+.2f}  max {max(dsnr):+.2f}   (95% CI ±{H['ci']:.2f})")
+        print(f"  SNR better on A: {better_a} ({100*better_a/len(pairs):.0f}%)   "
               f"on B: {better_b} ({100*better_b/len(pairs):.0f}%)   tie: {len(pairs)-better_a-better_b}")
-        hist = Counter(max(-10, min(10, d)) for d in drssi)
-        print("  RSSI delta histogram (dB, B-A):")
+        print(f"  RSSI: mean {mean(drssi):+.2f} dB  median {med(drssi):+.1f}  "
+              f"stdev {st.pstdev(drssi):.2f}  min {min(drssi):+d}  max {max(drssi):+d}   (calibration, not sensitivity)")
+        hist = Counter(max(-10, min(10, int(math.floor(d)))) for d in dsnr)
+        top = max(hist.values())
+        print("  SNR delta histogram (dB, B-A; left = A read it cleaner, right = B did):")
         for d in sorted(hist):
             lbl = f"{'<=' if d == -10 else '>=' if d == 10 else ''}{d:+d}"
-            print(f"    {lbl:>5} {'#' * hist[d]} {hist[d]}")
+            print(f"    {lbl:>5} {'#' * max(1, round(60 * hist[d] / top))} {hist[d]}")
+        ck = R["clock"]
+        print(f"  clocks: B stamps the same packet {ck['median']:+.2f} s relative to A (5th-95th pct {ck['p5']:+.2f}..{ck['p95']:+.2f} s, "
+              f"max |dt| {ck['max_abs']:.2f} s of a {MATCH_WINDOW_S:g} s window); {ck['wild']} pairs differ by more than 10 dB")
     print("-" * 96)
     for n in (A, B):
         only = n["only"]
         if only:
             print(f"Heard only by {n['name']}: {len(only)}  "
-                  f"(RSSI avg {mean([p['rssi'] for p in only]):.1f}, SNR avg {mean([p['snr'] for p in only]):.2f}, "
+                  f"(SNR avg {mean([p['snr'] for p in only]):.2f} — low means the other node ran out of sensitivity, high means collisions; "
                   f"types {dict(sorted(Counter(p['type'] for p in only).items()))})")
+    lv = [r for r in R["dsnr_by_level"] if r["n"] >= 5]
+    if lv:
+        print("-" * 96)
+        print("Sensitivity: of the transmissions on the air at each SNR (common scale), the share each node decoded; and the SNR offset there")
+        print(f"  {'SNR':>5} {'on air':>7} {'A dec':>6} {'B dec':>6}   {'dSNR B-A':>9} {'±95%':>5}")
+        cv = {c["snr"]: c for c in R["curves"]}
+        for r in lv:
+            c = cv.get(r["snr"], {"a": 0, "b": 0, "seen": 0})
+            pa_ = f"{100*c['a']/c['seen']:5.0f}%" if c["seen"] else "     -"
+            pb_ = f"{100*c['b']/c['seen']:5.0f}%" if c["seen"] else "     -"
+            print(f"  {r['snr']:>+5d} {c['seen']:7d} {pa_:>6} {pb_:>6}   {r['mean']:>+9.2f} {fmt(r['ci'],5,2)}")
     print("-" * 96)
-    print("Per upstream neighbour (last hop):  n=both / A-only / B-only, RSSI/SNR averages on matched, delta = B-A")
-    print(f"  {'hop':>6} {'both':>5} {'A-only':>6} {'B-only':>6}  {'RSSI A':>7} {'RSSI B':>7} {'dRSSI':>6}  {'SNR A':>6} {'SNR B':>6} {'dSNR':>6}")
+    print("Per upstream neighbour (last hop):  n=both / A-only / B-only, share of its packets each node decoded, SNR averages on matched, delta = B-A.  * = one-sided")
+    print(f"  {'hop':>7} {'both':>5} {'A-only':>6} {'B-only':>6} {'A%':>4} {'B%':>4}  {'SNR A':>6} {'SNR B':>6} {'dSNR':>6}  {'RSSI A':>7} {'RSSI B':>7}")
+    os_hops = set(R["one_sided"])
     for s in R["neighbours"][:25]:
-        print(f"  {s['hop']:>6} {s['both']:5d} {s['a']:6d} {s['b']:6d}  {fmt(s['rssi_a'],7)} {fmt(s['rssi_b'],7)} {fmt(s['drssi'],6)}  "
-              f"{fmt(s['snr_a'],6,2)} {fmt(s['snr_b'],6,2)} {fmt(s['dsnr'],6,2)}")
+        ha, hb = heard_share(s)
+        print(f"  {s['hop'] + ('*' if s['hop'] in os_hops else ''):>7} {s['both']:5d} {s['a']:6d} {s['b']:6d} {100*ha:3.0f}% {100*hb:3.0f}%  "
+              f"{fmt(s['snr_a'],6,2)} {fmt(s['snr_b'],6,2)} {fmt(s['dsnr'],6,2)}  {fmt(s['rssi_a'],7)} {fmt(s['rssi_b'],7)}")
     g = R["geo"]
     if g["mid"]:
         print("-" * 96)
@@ -1229,7 +1299,8 @@ def segbar(segments, tip=""):
 
 INFO = {
     "share": "Of every transmission at least one of the two nodes decoded, the share this node decoded. "
-             "Neither node transmits, so nothing is missed while busy sending: this is a clean receive comparison at the two positions.",
+             "A node's own transmissions, and the other node's direct copies of them, are left out. With both in no-TX mode nothing is "
+             "missed while busy sending, and this is a clean receive comparison at the two positions.",
     "ci": "95% confidence interval on the gap. Each transmission is a yes/no on each node, so the interval comes from the per-transmission difference (paired).",
     "scale": "The two radios report SNR with a fixed-ish offset on the same packet (B − A is the mean over every packet both decoded). "
              "For anything threshold-based — below −8 dB, the floor, the sensitivity curves — that offset is split between the nodes "
@@ -1270,6 +1341,144 @@ def tile(label, value, delta="", cls="", hero=False):
             f'<div class="d {cls}">{delta}</div></div>')
 
 
+def strip_tags(s):
+    """Plain text of a reading line: the HTML builders mark emphasis with <b> and link with <a>."""
+    import re
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).replace("\xa0", " ")
+
+
+def level_trend(rows, min_n=30):
+    """Is the SNR offset a function of signal level? Inverse-variance weighted straight line through the
+    per-level means. Returns (slope dB/dB, its SE, spread dB, n levels); NaN slope when there is too little."""
+    pts = [(r["snr"], r["mean"], r["ci"]) for r in rows if r["n"] >= min_n and r["ci"] == r["ci"] and r["ci"] > 0]
+    if len(pts) < 3:
+        lv = [r["mean"] for r in rows if r["n"] >= min_n]
+        return NAN, NAN, (max(lv) - min(lv) if len(lv) > 1 else NAN), len(lv)
+    w = [(1.96 / c) ** 2 for _, _, c in pts]
+    sw = sum(w); xm = sum(wi * x for wi, (x, _, _) in zip(w, pts)) / sw; ym = sum(wi * y for wi, (_, y, _) in zip(w, pts)) / sw
+    sxx = sum(wi * (x - xm) ** 2 for wi, (x, _, _) in zip(w, pts))
+    slope = sum(wi * (x - xm) * (y - ym) for wi, (x, y, _) in zip(w, pts)) / sxx
+    # the spread is quoted over the well-measured levels, so one thin bin doesn't set it
+    tight = [y for _, y, c in pts if c <= 0.5] or [y for _, y, _ in pts]
+    return slope, math.sqrt(1 / sxx), max(tight) - min(tight), len(pts)
+
+
+def headline(R):
+    """The numbers the tiles, the Reading and the text report all rest on."""
+    A, B, pairs = R["A"], R["B"], R["pairs"]
+    npair = len(pairs); oa, ob = len(A["only"]), len(B["only"])
+    union = npair + oa + ob
+    dsnr = R["dsnr"]; md = mean(dsnr)
+    # the gap is paired (every transmission is a yes/no on each node), so its CI comes from the per-transmission difference
+    gap = (ob - oa) / union if union else NAN
+    gap_ci = 1.96 * math.sqrt(max(0.0, (oa + ob) / union - gap * gap) / union) if union else NAN
+    sh = R["shared"]
+    ex_union = sh["pairs"] + sh["only_a"] + sh["only_b"]
+    ex_rate_a = (sh["pairs"] + sh["only_a"]) / ex_union if ex_union else NAN; ex_rate_b = (sh["pairs"] + sh["only_b"]) / ex_union if ex_union else NAN
+    os_hops = set(R["one_sided"])
+    return {"union": union, "npair": npair, "oa": oa, "ob": ob,
+            "rate_a": A["n"] / union if union else NAN, "rate_b": B["n"] / union if union else NAN,
+            "gap": gap, "gap_ci": gap_ci, "md": md,
+            "ci": 1.96 * st.pstdev(dsnr) / math.sqrt(npair) if npair > 1 else NAN,
+            "better_a": sum(1 for d in dsnr if d < 0), "better_b": sum(1 for d in dsnr if d > 0),
+            "fa": floor_stats(A, R["snr_shift"]["a"]), "fb": floor_stats(B, R["snr_shift"]["b"]),
+            "ex_union": ex_union, "ex_rate_a": ex_rate_a, "ex_rate_b": ex_rate_b, "ex_gap": ex_rate_b - ex_rate_a,
+            "ex_deep_a": sh["deep_a"], "ex_deep_b": sh["deep_b"],
+            "one_sided": [n for n in R["neighbours"] if n["hop"] in os_hops]}
+
+
+def heard_share(n):
+    u = n["both"] + n["a"] + n["b"]
+    return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
+
+
+def build_reading(R, H):
+    """A few sentences derived from the numbers, so the tiles don't contradict each other unexplained.
+    HTML strings; strip_tags() gives the text-report form."""
+    na, nb = R["A"]["name"], R["B"]["name"]
+    union, npair, gap, gap_ci, md = H["union"], H["npair"], H["gap"], H["gap_ci"], H["md"]
+    fa, fb, one_sided = H["fa"], H["fb"], H["one_sided"]
+    ex_rate_a, ex_rate_b, ex_gap = H["ex_rate_a"], H["ex_rate_b"], H["ex_gap"]
+    reading = []
+    if union:
+        lead_r = nb if gap > 0 else na
+        if one_sided and (ex_gap > 0) != (gap > 0) and abs(ex_gap) > gap_ci:
+            tail = f", but <b>the lead reverses</b> without the one-sided neighbours: {esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%."
+        elif one_sided and abs(ex_gap) <= gap_ci:
+            tail = f", but without the one-sided neighbours the two are level ({esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%)."
+        elif one_sided:
+            tail = f"; {100*ex_rate_a:.1f}% vs {100*ex_rate_b:.1f}% without the one-sided neighbours."
+        else:
+            tail = "."
+        if abs(gap) > gap_ci:
+            reading.append(f"<b>{esc(lead_r)} decoded {100*abs(gap):.1f} pts more</b> of the {union:,} transmissions on the air (±{100*gap_ci:.1f}){tail}")
+        else:
+            reading.append(f"<b>Both decoded the same share</b> of the {union:,} transmissions, within noise (gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts).")
+    if npair:
+        reader = nb if md > 0 else na
+        head = f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>"
+        slope, se, spread, nlv = level_trend(R["dsnr_by_level"])
+        # a trend across the whole range (B gains or loses relative to A as the signal weakens) is a real
+        # receive difference; the means wobbling about a flat line with no trend is the two radios' SNR
+        # quantisation meeting the bins, and says nothing about sensitivity
+        if slope == slope and abs(slope) > 2 * se and abs(slope) * 20 >= 0.5:
+            toward = nb if slope < 0 else na   # B − A falls as level rises: B is relatively better at the bottom
+            reading.append(f"{head}, and the offset drifts with level ({signed(10*slope, '.1f')} dB per 10 dB of signal), "
+                           f"so part of it is real: toward the floor the balance moves to <b>{esc(toward)}</b>.")
+        elif spread == spread and spread >= 1.0:
+            reading.append(f"{head}; the offset wobbles between levels (spread {spread:.1f} dB) but with no trend — "
+                           f"reporting and quantisation, not a receive difference.")
+        elif spread == spread:
+            reading.append(f"{head}, and the offset is the same at every signal level (spread {spread:.1f} dB) — "
+                           f"a reporting difference between the radios more than a receive difference.")
+        else:
+            reading.append(f"{head}.")
+    if fa["deep"] + fb["deep"] >= 20:
+        hi, lo = (fb, fa) if fb["deep"] > fa["deep"] else (fa, fb)
+        hn, ln = (nb, na) if fb["deep"] > fa["deep"] else (na, nb)
+        ex_hi, ex_lo = (H["ex_deep_b"], H["ex_deep_a"]) if hn == nb else (H["ex_deep_a"], H["ex_deep_b"])
+        gap_full, gap_sh = hi["deep"] - lo["deep"], ex_hi - ex_lo
+        share = 1 - gap_sh / gap_full if gap_full > 0 else 0
+        ex_tail = (f" Without the one-sided neighbours it is {ex_hi:,} against {ex_lo:,}"
+                   + (f" — {100*share:.0f}% of that gap was those neighbours." if share > 0.2 else ".")) if one_sided else ""
+        if hi["deep"] >= 1.25 * max(1, lo["deep"]):
+            reading.append(f"<b>{esc(hn)} decodes more of the deep packets</b>: {hi['deep']:,} below {signed(DEEP_DB)} dB against {lo['deep']:,} on a common SNR scale; "
+                           f"5th-percentile floor {signed(hi['snr_p5'], '.1f')} vs {signed(lo['snr_p5'], '.1f')} dB.{ex_tail}")
+        else:
+            reading.append(f"Both reach about the same floor: {fa['deep']:,} / {fb['deep']:,} packets below {signed(DEEP_DB)} dB, 5th-percentile floor {signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB.")
+    if one_sided:
+        who = lambda n: na if heard_share(n)[0] > heard_share(n)[1] else nb
+        reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
+                       + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard_share(n)):.0f}% vs {100*min(heard_share(n)):.0f}%)" for n in one_sided)
+                       + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
+                       + (f"— and the radios are {R['geo']['apart']:.1f} km apart, so this is expected. See <a href=\"#geo\">where the neighbours are</a>."
+                          if R["geo"]["mid"] and R["geo"]["apart"] > 1 else
+                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm."))
+    return reading
+
+
+def tx_note(R):
+    """One sentence on whether the nodes kept quiet — the premise of the comparison. (html, warn)."""
+    A, B, tx = R["A"], R["B"], R.get("tx") or {}
+    ta, tb = tx.get("A", {}), tx.get("B", {})
+    na, nb = esc(A["name"]), esc(B["name"])
+    mode = lambda t: t["mode"].replace("_", "-") if t.get("mode") else "unknown"
+    if not (ta.get("sent") or tb.get("sent")):
+        modes = (f" — {na} is in {mode(ta)} mode, {nb} in {mode(tb)} —"
+                 if (ta.get("mode") or tb.get("mode")) and not (ta.get("mode") == tb.get("mode") == "no_tx") else "")
+        return (f"Neither node transmitted in this window{modes} so the share of the traffic each one decoded is a clean receive "
+                f"comparison; SNR on shared packets explains it."), False
+    def side(n, t):
+        if not t.get("sent"):
+            return f"{n} sent nothing ({mode(t)} mode)"
+        s = f"<b>{n} sent {t['sent']:,} packet{'s' if t['sent'] != 1 else ''}</b> ({mode(t)} mode)"
+        if t.get("heard_by_other"):
+            s += f", {t['heard_by_other']:,} of them heard by the other node straight off its antenna"
+        return s
+    return (f"{side(na, ta)}; {side(nb, tb)}. Those packets are left out on both sides, so what remains is a receive comparison — "
+            f"but a node is deaf while it sends, and no-TX mode on both is the clean setup. SNR on shared packets explains the rest."), True
+
+
 def render_html(R, nav="", refresh=0):
     """Return the full report page. `nav` is optional HTML placed under the title (range links);
     `refresh` > 0 makes the page reload itself every that many seconds."""
@@ -1288,82 +1497,21 @@ def render_html(R, nav="", refresh=0):
     leg = f'<div class="legend"><span><span class="ch a">A</span>{esc(na)}</span><span><span class="ch b">B</span>{esc(nb)}</span></div>'
 
     # ---- headline row + per-node table
-    fa, fb = floor_stats(A, R["snr_shift"]["a"]), floor_stats(B, R["snr_shift"]["b"])
-    union = npair + len(A["only"]) + len(B["only"])
-    rate_a = A["n"] / union if union else NAN; rate_b = B["n"] / union if union else NAN
-    md = mean(dsnr)
-    ci = 1.96 * st.pstdev(dsnr) / math.sqrt(npair) if npair > 1 else NAN
-    lead = nb if md > 0 else na
+    H = headline(R)
+    fa, fb, union = H["fa"], H["fb"], H["union"]
+    rate_a, rate_b, md, ci, lead = H["rate_a"], H["rate_b"], H["md"], H["ci"], (nb if H["md"] > 0 else na)
     ties = npair - better_a - better_b
-    oa, ob = len(A["only"]), len(B["only"])
-    # the gap is paired (every transmission is a yes/no on each node), so its CI comes from the per-transmission difference
-    gap = (ob - oa) / union if union else NAN
-    gap_ci = 1.96 * math.sqrt(max(0.0, (oa + ob) / union - gap * gap) / union) if union else NAN
+    oa, ob, gap, gap_ci = H["oa"], H["ob"], H["gap"], H["gap_ci"]
     rate_bar = segbar([(oa / union, "a", f"A only {100*oa/union:.0f}%"), (npair / union, "n", f"both {100*npair/union:.0f}%"), (ob / union, "b", f"B only {100*ob/union:.0f}%")],
                       tip=f"only {na}: {oa:,} ({100*oa/union:.1f}%)\nboth: {npair:,} ({100*npair/union:.1f}%)\nonly {nb}: {ob:,} ({100*ob/union:.1f}%)") if union else ""
     snr_bar = segbar([(better_a / npair, "a", f"A {100*better_a/npair:.0f}%"), (ties / npair, "n", f"tie {100*ties/npair:.0f}%"), (better_b / npair, "b", f"B {100*better_b/npair:.0f}%")],
                      tip=f"{na} better: {better_a:,}\ntie: {ties:,}\n{nb} better: {better_b:,}") if npair else ""
     # neighbours one node hears and the other barely does: position, not receiver, and they move every
     # sensitivity number. Report the decode rate without them alongside the full one.
-    def heard(n):
-        u = n["both"] + n["a"] + n["b"]
-        return (n["both"] + n["a"]) / u, (n["both"] + n["b"]) / u
     os_hops = set(R["one_sided"])
-    one_sided = [n for n in R["neighbours"] if n["hop"] in os_hops]
-    sh = R["shared"]
-    ex_union = sh["pairs"] + sh["only_a"] + sh["only_b"]
-    ex_rate_a = (sh["pairs"] + sh["only_a"]) / ex_union if ex_union else NAN; ex_rate_b = (sh["pairs"] + sh["only_b"]) / ex_union if ex_union else NAN
-    ex_gap = ex_rate_b - ex_rate_a
-    ex_deep_a, ex_deep_b = sh["deep_a"], sh["deep_b"]
-
-    # ---- the reading: a few sentences derived from the numbers, so the tiles don't contradict each other unexplained
-    reading = []
-    if union:
-        lead_r, lag_r = (nb, na) if gap > 0 else (na, nb)
-        if one_sided and (ex_gap > 0) != (gap > 0) and abs(ex_gap) > gap_ci:
-            tail = f", but <b>the lead reverses</b> without the one-sided neighbours: {esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%."
-        elif one_sided and abs(ex_gap) <= gap_ci:
-            tail = f", but without the one-sided neighbours the two are level ({esc(na)} {100*ex_rate_a:.1f}% vs {esc(nb)} {100*ex_rate_b:.1f}%)."
-        elif one_sided:
-            tail = f"; {100*ex_rate_a:.1f}% vs {100*ex_rate_b:.1f}% without the one-sided neighbours."
-        else:
-            tail = "."
-        if abs(gap) > gap_ci:
-            reading.append(f"<b>{esc(lead_r)} decoded {100*abs(gap):.1f} pts more</b> of the {union:,} transmissions on the air (±{100*gap_ci:.1f}){tail}")
-        else:
-            reading.append(f"<b>Both decoded the same share</b> of the {union:,} transmissions, within noise (gap {signed(100*gap, '.1f')} ±{100*gap_ci:.1f} pts).")
-    if npair:
-        reader = nb if md > 0 else na
-        lv = [r["mean"] for r in R["dsnr_by_level"] if r["n"] >= 30]
-        spread = max(lv) - min(lv) if len(lv) > 1 else NAN
-        if spread == spread and spread < 1.0:
-            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>, and the offset is the same at every signal level (spread {spread:.1f} dB) — "
-                           f"a reporting difference between the radios more than a receive difference.")
-        elif spread == spread:
-            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>, but the offset changes with level (spread {spread:.1f} dB), so part of it is real.")
-        else:
-            reading.append(f"On the same packet <b>{esc(reader)} reads {abs(md):.2f} dB higher SNR</b>.")
-    if fa["deep"] + fb["deep"] >= 20:
-        hi, lo = (fb, fa) if fb["deep"] > fa["deep"] else (fa, fb)
-        hn, ln = (nb, na) if fb["deep"] > fa["deep"] else (na, nb)
-        ex_hi, ex_lo = (ex_deep_b, ex_deep_a) if hn == nb else (ex_deep_a, ex_deep_b)
-        gap_full, gap_sh = hi["deep"] - lo["deep"], ex_hi - ex_lo
-        share = 1 - gap_sh / gap_full if gap_full > 0 else 0
-        ex_tail = (f" Without the one-sided neighbours it is {ex_hi:,} against {ex_lo:,}"
-                   + (f" — {100*share:.0f}% of that gap was those neighbours." if share > 0.2 else ".")) if one_sided else ""
-        if hi["deep"] >= 1.25 * max(1, lo["deep"]):
-            reading.append(f"<b>{esc(hn)} decodes more of the deep packets</b>: {hi['deep']:,} below {signed(DEEP_DB)} dB against {lo['deep']:,} on a common SNR scale; "
-                           f"5th-percentile floor {signed(hi['snr_p5'], '.1f')} vs {signed(lo['snr_p5'], '.1f')} dB.{ex_tail}")
-        else:
-            reading.append(f"Both reach about the same floor: {fa['deep']:,} / {fb['deep']:,} packets below {signed(DEEP_DB)} dB, 5th-percentile floor {signed(fa['snr_p5'], '.1f')} / {signed(fb['snr_p5'], '.1f')} dB.")
-    if one_sided:
-        who = lambda n: na if heard(n)[0] > heard(n)[1] else nb
-        reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
-                       + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard(n)):.0f}% vs {100*min(heard(n)):.0f}%)" for n in one_sided)
-                       + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
-                       + (f"— and the radios are {R['geo']['apart']:.1f} km apart, so this is expected. See <a href=\"#geo\">where the neighbours are</a>."
-                          if R["geo"]["mid"] and R["geo"]["apart"] > 1 else
-                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm."))
+    one_sided = H["one_sided"]
+    ex_union, ex_rate_a, ex_rate_b = H["ex_union"], H["ex_rate_a"], H["ex_rate_b"]
+    reading = build_reading(R, H)
     reading_card = f'<div class="card reading"><h3>Reading{info("one_sided")}{info("scale")}</h3><ul>{"".join(f"<li>{r}</li>" for r in reading)}</ul></div>' if reading else ""
 
     # hero: what a mesh user asks first — which node hears more of what is on the air, and which one
@@ -1550,13 +1698,14 @@ def render_html(R, nav="", refresh=0):
 
     only_a_snr = [p["snr"] for p in A["only"]]; only_b_snr = [p["snr"] for p in B["only"]]
     meta = [hopname(p) for p, _ in pairs]
+    tx_text, tx_warn = tx_note(R)
 
     doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RX compare: {esc(na)} vs {esc(nb)}</title>{f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''}<style>{CSS}</style></head><body><main>
 <h1 class="who"><span class="node a"><span class="chip">A</span>{esc(na)}</span><span class="vs">vs</span><span class="node b"><span class="chip">B</span>{esc(nb)}</span></h1>
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
-A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s.
-Neither node transmits, so the share of the traffic each one decoded is a clean receive comparison; SNR on shared packets explains it. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
+A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
+<p class="meta{' warn' if tx_warn else ''}">{tx_text}</p>
 <nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#matched">Matched</a><a href="#neighbours">Neighbours</a><a href="#geo">Map</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
 <section id="overview" class="first">
@@ -1677,7 +1826,7 @@ def summary(R):
                 **floor_stats(n, sh_)}
     union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
     d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
-         "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"], "geo": R["geo"],
+         "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"], "geo": R["geo"], "tx": R.get("tx"),
          "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
          "delta_b_minus_a": {"snr_mean": mean(R["dsnr"]), "snr_median": med(R["dsnr"]),

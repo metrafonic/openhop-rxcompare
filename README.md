@@ -4,7 +4,8 @@
 
 Compare the receive performance of two openHop LoRa repeaters
 listening on the same channel — e.g. two different boards or antennas installed side by
-side, both in no-TX mode.
+side, both in no-TX mode (monitor mode works too: the node's own adverts and requests are
+taken out of the comparison, and the report says how many there were).
 
 It pulls packet history from each node's openHop API, joins the packets that both nodes
 heard (same `packet_hash` + `path_hash` within 3 s), and reports:
@@ -13,9 +14,11 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
   of every transmission at least one node heard, the share each node decoded,
   with a paired confidence interval and the same rate without *one-sided neighbours* (hops one
   node hears and the other barely does — position, not receiver)
+- a check that the nodes kept quiet: each node's repeater mode and how many packets it sent in
+  the window. A node's own packets, and the other node's direct copies of them, are left out
 - a **Reading** card that turns the headline numbers into a few sentences: who decodes more,
-  whether the SNR offset is flat across levels (reporting) or not (real), who reaches deeper,
-  and which neighbours are one-sided
+  whether the SNR offset drifts with signal level (real) or only wobbles about a flat line
+  (reporting and quantisation), who reaches deeper, and which neighbours are one-sided
 - **SNR on shared packets** (with a confidence interval), per upstream neighbour and over time —
   the diagnostic behind the decode rate, not the outcome (RSSI is calibrated differently per
   radio and is shown but flagged as such)
@@ -146,7 +149,11 @@ API keys are created in the openHop web UI under *Sessions → API tokens*.
 
 ## How the comparison works
 
-Both nodes log every packet they decode with RSSI and SNR. A transmission is identified by
+Both nodes log every packet they decode with RSSI and SNR. Packets a node originated itself (its
+adverts, openHop's own requests, a companion app's traffic) sit in the same log with RSSI 0 and
+are not receptions; they are dropped, and when the node did send one, the other node's direct
+copy of it (same hash within 3 s, no upstream hop) is dropped too, since the sender could not
+have heard it. The report says how many such packets there were. A transmission is identified by
 `(packet_hash, path_hash)` — the same payload relayed by two different neighbours is two
 different transmissions — and matched across nodes when the timestamps are within 3 s.
 The comparison window is clamped to the period where both nodes have data, so a restart on
