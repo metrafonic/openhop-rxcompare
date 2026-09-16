@@ -407,7 +407,7 @@ def analyze(A, B, hours):
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
-        "one_sided": one_sided, "geo": geo,
+        "one_sided": one_sided, "geo": geo, "canon": canon,
         "shared": {"pairs": len(sh_pairs), "only_a": len(sh_only_a), "only_b": len(sh_only_b),
                    "deep_a": sum(1 for p, _ in sh_pairs if p["snr"] + shift["a"] < DEEP_DB) + sum(1 for p in sh_only_a if p["snr"] + shift["a"] < DEEP_DB),
                    "deep_b": sum(1 for _, q in sh_pairs if q["snr"] + shift["b"] < DEEP_DB) + sum(1 for q in sh_only_b if q["snr"] + shift["b"] < DEEP_DB)},
@@ -1280,7 +1280,9 @@ def render_html(R, nav="", refresh=0):
     `refresh` > 0 makes the page reload itself every that many seconds."""
     A, B, pairs = R["A"], R["B"], R["pairs"]
     na, nb = A["name"], B["name"]
-    canon = hop_canon({p.get("upstream_hash") for p, _ in pairs} | {p.get("upstream_hash") for p in A["only"]} | {q.get("upstream_hash") for q in B["only"]})
+    # the same hash folding analyze() used for R["neighbours"]: rebuilding it from a different packet set
+    # would name a hop the neighbour list doesn't have
+    canon = R["canon"]
     hopname = lambda p: canon.get(p.get("upstream_hash"), p.get("upstream_hash")) or "direct"
     drssi, dsnr = R["drssi"], R["dsnr"]
     npair = len(pairs)
