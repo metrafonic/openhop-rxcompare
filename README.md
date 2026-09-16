@@ -42,6 +42,44 @@ paths) are merged so each neighbour appears once.
 
 ![report](docs/report.png)
 
+## What it looks like
+
+The headline: share of every transmission on the air that each node decoded, who reaches
+deeper into the noise, the SNR offset on shared packets, and a Reading card that says what it
+adds up to (above). Then the sections behind it:
+
+**Sensitivity or collisions?** — for every transmission one node decoded at a given SNR, the
+share the other also decoded (the higher curve is the more sensitive receiver); the SNR offset
+by signal level (flat = calibration, bent = real); decode rate by packet type.
+
+![sensitivity](docs/sensitivity.png)
+
+**By upstream neighbour** — SNR delta per last hop, and each neighbour's mean SNR on both nodes
+side by side, so the ones sitting at the decode threshold stand out. ◐ marks a one-sided
+neighbour.
+
+![neighbours](docs/neighbours.png)
+
+**Where the neighbours are** — every neighbour whose advert carried a position, on a
+bearing-and-distance radar (log distance; each circle is filled with the share each node
+decodes), SNR against distance with a fit per node, and a reading that says whether the
+difference has a *direction*. The terrain map (Leaflet, loaded on request) sits next to the
+radar and is left out of this screenshot.
+
+![where the neighbours are](docs/geo.png)
+
+**Over time** — packets and decode rate per bucket, the SNR delta (should be flat), noise
+floor, deep decodes and CRC errors per node.
+
+![over time](docs/time.png)
+
+**Explore a neighbour** — every packet from one hop across the window on both nodes: filled
+dots joined by a stem were decoded by both, hollow rings by one node only.
+
+![explore](docs/explore.png)
+
+Neighbour hashes and positions in these screenshots are scrambled; the numbers are real.
+
 ## Run with Docker
 
 A multi-arch image (amd64, arm64) is published to
