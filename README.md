@@ -21,7 +21,7 @@ heard (same `packet_hash` + `path_hash` within 3 s), and reports:
   radio and is shown but flagged as such)
 - packets **only one node** decoded: how weak they were (sensitivity vs. collisions) and
   which neighbours each node misses
-- **sensitivity or collisions**: the chance the other node also decoded a packet, by SNR
+- **sensitivity or collisions**: the chance each node decodes a packet, by signal level
   (each node's real floor), the SNR offset by signal level (calibration vs. genuine), and
   decode rate by packet type (long packets collide more)
 - **decode rate over time** and a match-quality check (clock offset between the nodes,
@@ -48,9 +48,9 @@ The headline: share of every transmission on the air that each node decoded, who
 deeper into the noise, the SNR offset on shared packets, and a Reading card that says what it
 adds up to (above). Then the sections behind it:
 
-**Sensitivity or collisions?** — for every transmission one node decoded at a given SNR, the
-share the other also decoded (the higher curve is the more sensitive receiver); the SNR offset
-by signal level (flat = calibration, bent = real); decode rate by packet type.
+**Sensitivity or collisions?** — of the transmissions on the air at a given SNR, the share each
+node decoded (where a curve drops is that node's floor); the SNR offset by signal level
+(flat = calibration, bent = real); decode rate by packet type.
 
 ![sensitivity](docs/sensitivity.png)
 

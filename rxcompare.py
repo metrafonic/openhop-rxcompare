@@ -356,19 +356,19 @@ def analyze(A, B, hours):
     sh_only_a = [p for p in only_a if hop_of(p) not in os_hops]
     sh_only_b = [q for q in only_b if hop_of(q) not in os_hops]
 
-    # sensitivity curves: given one node decoded a transmission at SNR s, did the other?
-    # binned by the reference node's own reading, so each curve is on that node's scale
+    # sensitivity curves: of the transmissions on the air at SNR s, the share each node decoded. The level
+    # is the packet's, on the common scale: the mean of both readings when both heard it, else the one there is
     LVL = 2
     lvl = lambda v: max(-14, min(12, math.floor(v / LVL) * LVL))
-    curve = {"a_given_b": defaultdict(lambda: [0, 0]), "b_given_a": defaultdict(lambda: [0, 0])}  # bin -> [decoded, seen]
+    curve = defaultdict(lambda: [0, 0, 0])   # bin -> [a decoded, b decoded, on the air]
     for p, q in sh_pairs:
-        curve["b_given_a"][lvl(p["snr"] + shift["a"])][0] += 1; curve["b_given_a"][lvl(p["snr"] + shift["a"])][1] += 1
-        curve["a_given_b"][lvl(q["snr"] + shift["b"])][0] += 1; curve["a_given_b"][lvl(q["snr"] + shift["b"])][1] += 1
+        c = curve[lvl((p["snr"] + shift["a"] + q["snr"] + shift["b"]) / 2)]
+        c[0] += 1; c[1] += 1; c[2] += 1
     for p in sh_only_a:
-        curve["b_given_a"][lvl(p["snr"] + shift["a"])][1] += 1
+        c = curve[lvl(p["snr"] + shift["a"])]; c[0] += 1; c[2] += 1
     for q in sh_only_b:
-        curve["a_given_b"][lvl(q["snr"] + shift["b"])][1] += 1
-    curves = {k: [{"snr": x, "decoded": v[0], "seen": v[1]} for x, v in sorted(c.items())] for k, c in curve.items()}
+        c = curve[lvl(q["snr"] + shift["b"])]; c[1] += 1; c[2] += 1
+    curves = [{"snr": x, "a": v[0], "b": v[1], "seen": v[2]} for x, v in sorted(curve.items())]
 
     # SNR delta by signal level, keyed on the packet's mean reading so neither node's noise biases the bin
     by_level = defaultdict(list)
@@ -972,50 +972,42 @@ def chart_excl_neighbours(neigh, na, nb, flag=frozenset()):
 
 
 def chart_decode_curve(curves, na, nb, step=2, min_n=5):
-    """Sensitivity curves: P(A decoded | B heard it at SNR s) in A's colour, and vice versa.
-    Each curve sits on the reference node's own SNR scale."""
-    series = [("a_given_b", "var(--a)", na, nb), ("b_given_a", "var(--b)", nb, na)]
-    pts = {k: [c for c in curves[k] if c["seen"] >= min_n] for k, *_ in series}
-    if not any(pts.values()):
+    """Sensitivity curves: of the transmissions on the air at SNR s, the share each node decoded.
+    Both curves share the denominator, so the sample-size bars are one set."""
+    series = [("a", "var(--a)", na), ("b", "var(--b)", nb)]
+    pts = [c for c in curves if c["seen"] >= min_n]
+    if not pts:
         return "<p>not enough packets yet</p>"
     s = Svg(w=520, h=270, ml=44, mb=40)
     s.scales(-14 - step / 2, 12 + step * 1.5, 0, 1.06)
     s.axes(list(range(-14, 13, 4)), [0, .25, .5, .75, 1], xfmt=lambda t: ("≤" if t == -14 else "") + signed(t), yfmt=lambda t: f"{100*t:.0f}%")
-    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-4}" text-anchor="middle">SNR as read by the node that heard it, dB</text>')
+    s.add(f'<text class="lbl" x="{(s.ml+s.w-s.mr)/2:.0f}" y="{s.h-4}" text-anchor="middle">SNR of the transmission, common scale, dB</text>')
     # sample size per bin as a faint bar behind the curves, so a point on 8 packets doesn't read like one on 800
-    mxn = max(c["seen"] for k in pts for c in pts[k]) or 1
+    mxn = max(c["seen"] for c in pts) or 1
     bw = (s.x(step) - s.x(0)) - 3
-    for k, col, who, ref in series:
-        for i, c in enumerate(pts[k]):
-            x = s.x(c["snr"] + step / 2) - bw / 2 + (bw / 2 if k == "b_given_a" else 0)
-            top = s.y(0.35 * c["seen"] / mxn)
-            s.add(f'<rect x="{x:.1f}" y="{top:.1f}" width="{bw/2:.1f}" height="{s.y(0)-top:.1f}" fill="{col}" fill-opacity=".14" pointer-events="none"/>')
-    for k, col, who, ref in series:
+    for c in pts:
+        x = s.x(c["snr"] + step / 2) - bw / 2
+        top = s.y(0.35 * c["seen"] / mxn)
+        s.add(f'<rect x="{x:.1f}" y="{top:.1f}" width="{bw:.1f}" height="{s.y(0)-top:.1f}" fill="var(--ink)" fill-opacity=".07" pointer-events="none"/>')
+    for k, col, who in series:
         d, pen = [], False
-        for c in pts[k]:
-            x, y = s.x(c["snr"] + step / 2), s.y(c["decoded"] / c["seen"])
+        for c in pts:
+            x, y = s.x(c["snr"] + step / 2), s.y(c[k] / c["seen"])
             d.append(f'{"L" if pen else "M"}{x:.1f},{y:.1f}'); pen = True
         s.add(f'<path fill="none" stroke="{col}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" d="{"".join(d)}"/>')
     # one hit column per bin with both nodes' figures
-    bins = sorted({c["snr"] for k in pts for c in pts[k]})
     half = (s.x(step) - s.x(0)) / 2
-    for x in bins:
-        tip = [f"{signed(x)}…{signed(x + step)} dB"]
-        for k, col, who, ref in series:
-            c = next((c for c in pts[k] if c["snr"] == x), None)
-            if c:
-                pr = c["decoded"] / c["seen"]; ci = 1.96 * math.sqrt(pr * (1 - pr) / c["seen"])
-                tip.append(f"{ref} heard {c['seen']} at that level · {who} also decoded {c['decoded']} ({100*pr:.0f}% ±{100*ci:.0f})")
-        cx = s.x(x + step / 2)
+    for c in pts:
+        tip = [f"{signed(c['snr'])}…{signed(c['snr'] + step)} dB: {c['seen']} transmissions on the air"]
+        cx = s.x(c["snr"] + step / 2)
+        for k, col, who in series:
+            pr = c[k] / c["seen"]; ci = 1.96 * math.sqrt(pr * (1 - pr) / c["seen"])
+            tip.append(f"{who} decoded {c[k]} ({100*pr:.0f}% ±{100*ci:.0f})")
+            y1, y2 = s.y(max(0, pr - ci)), s.y(min(1, pr + ci))
+            s.add(f'<path d="M{cx:.1f},{y1:.1f}V{y2:.1f}M{cx-3:.1f},{y1:.1f}h6M{cx-3:.1f},{y2:.1f}h6" stroke="{col}" stroke-width="1.5" fill="none" pointer-events="none"/>')
+            s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{s.y(pr):.1f}" r="{3 + min(2, math.log10(c["seen"])):.1f}" fill="{col}" '
+                  f'stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
         s.add(f'<rect class="hit" x="{cx-half:.1f}" y="{s.mt}" width="{2*half:.1f}" height="{s.h-s.mt-s.mb}" data-tip="{esc(chr(10).join(tip))}"/>')
-        for k, col, who, ref in series:
-            c = next((c for c in pts[k] if c["snr"] == x), None)
-            if c:
-                pr = c["decoded"] / c["seen"]; ci = 1.96 * math.sqrt(pr * (1 - pr) / c["seen"])
-                y1, y2 = s.y(max(0, pr - ci)), s.y(min(1, pr + ci))
-                s.add(f'<path d="M{cx:.1f},{y1:.1f}V{y2:.1f}M{cx-3:.1f},{y1:.1f}h6M{cx-3:.1f},{y2:.1f}h6" stroke="{col}" stroke-width="1.5" fill="none" pointer-events="none"/>')
-                s.add(f'<circle class="mark" cx="{cx:.1f}" cy="{s.y(pr):.1f}" r="{3 + min(2, math.log10(c["seen"])):.1f}" fill="{col}" '
-                      f'stroke="var(--surface)" stroke-width="2" pointer-events="none"/>')
     return s.render()
 
 
@@ -1261,8 +1253,11 @@ INFO = {
     "geo": "Neighbour positions come from the neighbours' own adverts (MeshCore adverts carry lat/lon when the node has one set), "
            "matched to the hop hash, which is the first 1–3 bytes of the node's public key. The radios' positions come from openHop's GPS or manual position. "
            "A 1-byte hash that several advertised keys start with is left off as ambiguous.",
-    "curve": "For every transmission the reference node decoded at a given SNR (common scale), the share the other node also decoded. "
-             "The higher curve is the more sensitive receiver. Only neighbours both positions hear are included.",
+    "curve": "Every transmission at least one node decoded, binned by its SNR on the common scale — the mean of both readings when "
+             "both heard it, otherwise the one reading there is — and, per bin, the share each node decoded. The higher curve is "
+             "the more sensitive receiver. At the very bottom most transmissions are known only because the deeper node decoded "
+             "them, so its curve stays high there partly by construction; the gap between the curves is the information. "
+             "Only neighbours both positions hear are included.",
 }
 
 
@@ -1584,7 +1579,7 @@ Neither node transmits, so the share of the traffic each one decoded is a clean 
 <h2>Sensitivity or collisions?</h2>
 <p class="meta">Where each node stops decoding, whether the SNR offset between them is the same at every level, and whether misses depend on how long a packet is on the air. These are questions about the radios, so this section uses only the neighbours both positions hear{f" ({', '.join(esc(h) for h in R['one_sided'])} left out)" if one_sided else ""}.</p>
 <div class="grid2">
-<div class="card"><h3>Chance the other node decoded it too{info("curve")}{info("scale")}</h3><p>For every transmission one node decoded at a given SNR, the share the other node also decoded. The higher curve is the more sensitive receiver. Whiskers are 95% CI; the faint bars are how many packets each point rests on. Readings are on a common scale (the {signed(md, ".2f")} dB offset between the radios split between them).</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
+<div class="card"><h3>Chance each node decodes a packet, by signal level{info("curve")}{info("scale")}</h3><p>Of the transmissions on the air at a given SNR, the share each node decoded. Where a curve drops is that node's floor; the higher curve is the more sensitive receiver. Whiskers are 95% CI; the faint bars are how many transmissions each level rests on. Readings are on a common scale (the {signed(md, ".2f")} dB offset between the radios split between them).</p>{leg}{chart_decode_curve(R['curves'], na, nb)}</div>
 <div class="card"><h3>Δ SNR by signal level, B − A{info("level")}</h3><p>Flat means a fixed reporting offset between the radios. A slope or a bend near the floor means they genuinely differ where it matters. Whiskers are 95% CI.</p>{chart_delta_by_level(R['dsnr_by_level'], na, nb)}</div>
 <div class="card"><h3>Decode rate by packet type</h3><p>Long packets sit on the air longer and collide more. A gap that opens only on long types is timing, not sensitivity.</p>{leg}{chart_type_rates(R['by_type'], na, nb)}</div>
 </div>
