@@ -9,6 +9,10 @@ services:
       - "${LISTEN_PORT:-8090}:8080"
     volumes:
       - rxcompare-data:/data   # advert cache (ADVERT_CACHE), so neighbour positions survive restarts
+      # More than two systems, or a multiradio one? Copy receivers.example.yml to receivers.yml and
+      # uncomment. Without it the A_*/B_* vars in .env are used, and a multiradio system there still
+      # gets its radios folded together correctly — you just cannot pick them apart in the report.
+      #- ./receivers.yml:/app/receivers.yml:ro
     restart: unless-stopped
 
 volumes:

@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
-"""Compare RX performance of two openHop repeaters listening on the same channel.
+"""Compare RX performance of two openHop receivers listening on the same channel.
 
-Joins packets seen on both nodes by (packet_hash, path_hash, timestamp within
+A receiver is one radio of one system, or a whole system with its radios folded together, so this
+compares two boxes, or two radios on one multiradio box, with the same analysis either way.
+
+Joins packets seen on both receivers by (packet_hash, path_hash, timestamp within
 a few seconds) and reports the share of the traffic each node decoded, SNR deltas,
 packets heard by only one node, per-neighbour breakdown, noise floor and CRC errors.
 Each node's own transmissions (none in no-TX mode, a few in monitor mode) are left
 out on both sides.
 
 Usage:
-  ./rxcompare.py                       # last hour, text report
+  ./rxcompare.py --list                # the receivers on offer
+  ./rxcompare.py                       # last hour, text report, default pair
+  ./rxcompare.py --a heltec:local --b heltec:link --hours 6    # two radios on one system
   ./rxcompare.py --hours 6 --html report.html
   ./rxcompare.py --watch 60 --html report.html   # regenerate every 60s
   ./rxcompare.py --csv pairs.csv       # dump matched pairs
 
-Keys/URLs come from env: A_URL A_KEY A_NAME B_URL B_KEY B_NAME
-(or the --a-url/--a-key/... flags).
+Receivers come from receivers.yml (or --config): one entry per openHop system, its radios discovered
+from the API, so a multiradio box offers one receiver per radio plus one for the box as a whole.
+--list shows them; --a/--b pick the two to compare. With no config file the A_*/B_* environment
+variables are used instead, which is the two-node setup this started as.
 """
 import argparse, csv, html, json, math, os, ssl, statistics as st, struct, sys, time, urllib.request, urllib.parse
 from collections import Counter, defaultdict
 
-MATCH_WINDOW_S = 3.0   # both nodes hear the same transmission within this many seconds
+MATCH_WINDOW_S = 3.0   # two systems hear the same transmission within this many seconds
+SAME_SITE_WINDOW_S = 0.25   # two radios on one system share a clock: their rows are milliseconds apart
+RADIO_SCAN_H = 6       # how far back to look for the radio ids a system tags its receptions with
+RADIO_SCAN_TTL_S = 300
+RADIO_SCAN_TIMEOUT_S = 5
 DEEP_DB = -8   # "deep" packets: decoded this far below the noise, where receiver sensitivity is what decides
 TYPE_NAMES = {0: "REQ", 1: "RESPONSE", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "GRP_TXT", 6: "GRP_DATA",
               7: "ANON_REQ", 8: "PATH", 9: "TRACE", 10: "MULTIPART", 11: "CONTROL"}
@@ -42,34 +53,66 @@ def _ssl_ctx():
 CTX = _ssl_ctx()
 
 
-# --------------------------------------------------------------------------- API
+# --------------------------------------------------------------------------- receivers
 
-class Node:
-    def __init__(self, name, url, key, lat=None, lon=None):
-        self.name, self.url, self.key = name, url.rstrip("/"), key
-        self.pos = (float(lat), float(lon)) if lat and lon else None   # configured override for position()
+class Site:
+    """One openHop system: a URL, a key, a position, and one or more radios.
 
-    def get(self, path, **params):
+    Packet history is fetched once per window and shared by the site's radios, so comparing two radios
+    on the same box costs one API pass, not two. Everything that belongs to the system rather than to a
+    radio — repeater mode, noise floor, CRC errors, position, the adverts it has heard — lives here.
+    """
+
+    def __init__(self, id, url, key, label=None, lat=None, lon=None, radios=None):
+        self.id, self.label = id, label or id
+        self.url, self.key = url.rstrip("/"), key
+        self.pos = (float(lat), float(lon)) if lat not in (None, "") and lon not in (None, "") else None
+        self.radio_labels = {k: (v.get("label") if isinstance(v, dict) else v) for k, v in (radios or {}).items()}
+        self._rows = None        # (start, end, rows) for the last window asked for
+        self._radios = None      # (fetched_at, [radio ids])
+        self._adv = {}           # lookback hours -> adverts
+
+    def get(self, path, timeout=30, **params):
         q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         req = urllib.request.Request(f"{self.url}/api/{path}?{q}", headers={"X-API-Key": self.key})
-        with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
             return json.load(r)
 
-    def packets(self, start, end):
-        """(received, own). Packets the node originated itself — its adverts, openHop's own requests and
-        path replies, a companion app's traffic — land in the same table as receptions, with rssi 0 (the
-        SNR there is not a measurement: some builds log 0, others a fixed ~12.5) and, in no-TX mode,
-        drop_reason "No TX mode". They were never received here, so they are kept apart; the ones the
-        node did send (`transmitted`) matter to the other side, see analyze()."""
-        out, own, offset = [], [], 0
+    def rows(self, start, end):
+        """Every packet row in the window, all radios, newest page first. Cached for the window last
+        asked for, which is how both radios of a site share one fetch."""
+        c = self._rows
+        if c and abs(c[0] - start) < 1 and abs(c[1] - end) < 1:
+            return c[2]
+        out, offset = [], 0
         while True:
             d = self.get("bulk_packets", start_timestamp=start, end_timestamp=end, limit=PAGE, offset=offset)
             batch = d.get("data", [])
-            for p in batch:
-                (own if p.get("transmitted") or p.get("rssi") == 0 else out).append(p)
+            out.extend(batch)
             if len(batch) < PAGE:
-                return out, own
+                break
             offset += PAGE
+        self._rows = (start, end, out)
+        return out
+
+    def radios(self):
+        """The radio ids this system tags its receptions with (openHop's `rx_radio_id`, e.g. "local",
+        "link"). Empty on a single-radio system, or a build too old to report the field, where the site
+        is simply one nameless receiver. Read from the newest page of history, so a radio that has been
+        silent for the whole scan window does not appear."""
+        if self._radios and time.time() - self._radios[0] < RADIO_SCAN_TTL_S:
+            return self._radios[1]
+        ids = set()
+        try:
+            end = time.time()
+            # a site that is down should not stall the registry for the full API timeout: it simply
+            # offers its one plain receiver until the next scan finds it back
+            d = self.get("bulk_packets", timeout=RADIO_SCAN_TIMEOUT_S, start_timestamp=end - RADIO_SCAN_H * 3600, end_timestamp=end, limit=PAGE)
+            ids = {p["rx_radio_id"] for p in d.get("data", []) if p.get("rx_radio_id")}
+        except Exception:
+            pass
+        self._radios = (time.time(), sorted(ids))
+        return self._radios[1]
 
     def mode(self):
         """openHop's repeater mode ("no_tx", "monitor", "normal", …), or None on builds without it."""
@@ -93,7 +136,7 @@ class Node:
         return [(x["timestamp"], x["count"]) for x in h if x.get("count") is not None]
 
     def position(self):
-        """(lat, lon) of this repeater: the configured override, else openHop's effective position
+        """(lat, lon) of this system: the configured override, else openHop's effective position
         (manual config until a GPS fix). None when neither is set."""
         if self.pos:
             return self.pos
@@ -108,6 +151,8 @@ class Node:
         """pubkey -> latest decoded advert seen in the packet history (any hop away). Nodes advertise once a
         day or less, so this pages back through the whole lookback rather than stopping at one 5000-row
         answer. Older openHop builds without the endpoint yield nothing and the map simply stays empty."""
+        if hours in self._adv:
+            return self._adv[hours]
         end = time.time()
         start = end - hours * 3600
         rows, until = [], end
@@ -131,7 +176,176 @@ class Node:
             if prev and d["lat"] is None:   # newest advert wins, but a position is never lost to a later advert without one
                 d["lat"], d["lon"] = prev["lat"], prev["lon"]
             out[d["pubkey"]] = d
+        self._adv[hours] = out
         return out
+
+
+def collapse_radios(rows):
+    """One transmission decoded by several radios on the same system arrives as one row per radio, the
+    same `packet_hash` and `path_hash` a few milliseconds apart on the one clock. Keep the best-SNR row
+    of each such cluster, so a whole-site receiver counts every transmission once however many radios
+    heard it. (Re-floods by different neighbours are seconds apart and stay separate rows.)"""
+    groups, open_ = [], {}
+    for p in sorted(rows, key=lambda p: p["timestamp"]):
+        k = (p.get("packet_hash"), p.get("path_hash"))
+        g = open_.get(k)
+        if g is not None and p["timestamp"] - g[-1]["timestamp"] < SAME_SITE_WINDOW_S:
+            g.append(p)
+            continue
+        g = [p]
+        open_[k] = g
+        groups.append(g)
+    return [max(g, key=lambda p: p["snr"]) for g in groups]
+
+
+class Receiver:
+    """One radio on one site — the unit the comparison is built from. `radio` None means the site as a
+    whole: all of its radios, duplicate decodes collapsed, which is what a single-radio node has always
+    been. Two receivers are compared at a time; `cosited` says whether they share a box, and with it a
+    clock, a position and a repeater mode."""
+
+    def __init__(self, site, radio=None, label=None):
+        self.site, self.radio, self._label = site, radio, label
+
+    @property
+    def id(self):
+        return f"{self.site.id}:{self.radio}" if self.radio else self.site.id
+
+    @property
+    def name(self):
+        if self._label:
+            return self._label
+        if not self.radio:
+            return self.site.label
+        return f"{self.site.label} {self.site.radio_labels.get(self.radio) or self.radio}"
+
+    @property
+    def url(self):
+        return self.site.url
+
+    def cosited(self, other):
+        return self.site is other.site
+
+    def packets(self, start, end):
+        """(received, own). Packets the node originated itself — its adverts, openHop's own requests and
+        path replies, a companion app's traffic — land in the same table as receptions, with rssi 0 (the
+        SNR there is not a measurement: some builds log 0, others a fixed ~12.5) and, in no-TX mode,
+        drop_reason "No TX mode". They were never received here, so they are kept apart; the ones the
+        node did send (`transmitted`) matter to the other side, see analyze().
+
+        Own transmissions belong to the system, not to a radio: openHop logs the loopback row against
+        whichever radio was idle, so they are taken site-wide whatever this receiver listens on. A radio
+        receiver takes only the receptions actually tagged to it — untagged rows from before multiradio
+        was switched on belong to no radio in particular and are left out, which makes the comparison
+        start where the tagging did."""
+        recv, own = [], []
+        for p in self.site.rows(start, end):
+            if p.get("transmitted") or p.get("rssi") == 0:
+                own.append(p)
+            elif self.radio is None or p.get("rx_radio_id") == self.radio:
+                recv.append(p)
+        return (collapse_radios(recv) if self.radio is None else recv), own
+
+    # --- site-level figures, the same for every radio on the box
+    def mode(self):
+        return self.site.mode()
+
+    def noise(self, hours):
+        return self.site.noise(hours)
+
+    def crc_history(self, hours):
+        return self.site.crc_history(hours)
+
+    def position(self):
+        return self.site.position()
+
+    def adverts(self, hours):
+        return self.site.adverts(hours)
+
+
+def load_sites(path=None):
+    """The receiver registry: a YAML (needs PyYAML) or JSON file listing the systems to compare, each
+    with a url, a key, an optional label and position, and optional labels for its radios. `${VAR}` in
+    any string is taken from the environment, so keys stay out of the file.
+
+    With no file, the A_*/B_* environment variables are used, so a two-node .env keeps working.
+    Returns (sites, default pair of receiver ids or None)."""
+    path = path or os.environ.get("RECEIVERS")
+    if not path:
+        for c in ("receivers.yml", "receivers.yaml", "receivers.json"):
+            if os.path.exists(c):
+                path = c
+                break
+    if not path:
+        sites = []
+        for s in "AB":
+            if os.environ.get(f"{s}_URL") and os.environ.get(f"{s}_KEY"):
+                sites.append(Site(os.environ.get(f"{s}_NAME") or s, os.environ[f"{s}_URL"], os.environ[f"{s}_KEY"],
+                                  label=os.environ.get(f"{s}_NAME") or s,
+                                  lat=os.environ.get(f"{s}_LAT"), lon=os.environ.get(f"{s}_LON")))
+        return sites, None
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError as e:
+        sys.exit(f"receivers file {path}: {e.strerror}")
+    if path.endswith((".yml", ".yaml")):
+        try:
+            import yaml
+        except ImportError:
+            sys.exit(f"{path}: reading YAML needs PyYAML (pip install pyyaml), or write the same file as JSON")
+        cfg = yaml.safe_load(raw)
+    else:
+        cfg = json.loads(raw)
+    sites = []
+    for i, s in enumerate(cfg.get("sites") or []):
+        exp = lambda v: os.path.expandvars(v) if isinstance(v, str) else v
+        sid = str(s.get("id") or s.get("label") or f"site{i + 1}")
+        url, key = exp(s.get("url") or ""), exp(s.get("key") or "")
+        if not (url and key):
+            sys.exit(f"{path}: site {sid!r} needs a url and a key")
+        sites.append(Site(sid, url, key, label=s.get("label"), lat=exp(s.get("lat")), lon=exp(s.get("lon")),
+                          radios=s.get("radios")))
+    if not sites:
+        sys.exit(f"{path}: no sites listed")
+    default = cfg.get("default") or cfg.get("compare")
+    return sites, tuple(default)[:2] if default else None
+
+
+def receivers_of(sites):
+    """Every receiver the configured sites offer, in a stable order: each radio of a multiradio system,
+    then the system as a whole (all its radios at once). Discovery hits each site's API, so a site that
+    is offline contributes the one plain receiver it would have had."""
+    out = {}
+    for s in sites:
+        radios = s.radios()
+        for r in radios:
+            rv = Receiver(s, r)
+            out[rv.id] = rv
+        rv = Receiver(s, None, label=f"{s.label} (all radios)" if len(radios) > 1 else None)
+        out[rv.id] = rv
+    return out
+
+
+def pick_receivers(sites, a=None, b=None, default=None):
+    """Resolve two receiver ids against the registry. Unqualified ("heltec") means the whole site;
+    with no ids at all, the configured default pair, else the first two on offer."""
+    reg = receivers_of(sites)
+    ids = [x for x in (a, b) if x]
+    if not ids:
+        ids = list(default or [])
+    if not ids:
+        ids = list(reg)[:2]
+    if len(ids) != 2:
+        sys.exit(f"need two receivers to compare, got {ids}; available: {', '.join(reg) or 'none'}")
+    if ids[0] == ids[1]:
+        sys.exit(f"{ids[0]!r} twice: pick two different receivers from {', '.join(reg)}")
+    picked = []
+    for i in ids:
+        if i not in reg:
+            sys.exit(f"unknown receiver {i!r}; available: {', '.join(reg)}")
+        picked.append(reg[i])
+    return picked[0], picked[1]
 
 
 def decode_advert(payload_hex):
@@ -163,14 +377,15 @@ def key(p):
     return (p.get("packet_hash"), p.get("path_hash"))
 
 
-def match(pa, pb):
-    """Greedy nearest-timestamp join. Returns (pairs, only_a, only_b)."""
+def match(pa, pb, window=MATCH_WINDOW_S):
+    """Greedy nearest-timestamp join. Returns (pairs, only_a, only_b). Two radios on one system share a
+    clock and land milliseconds apart, so the window there is tight enough not to swallow a re-flood."""
     idx = defaultdict(list)
     for p in pb:
         idx[key(p)].append(p)
     used, pairs, only_a = set(), [], []
     for p in sorted(pa, key=lambda p: p["timestamp"]):
-        best, bdt = None, MATCH_WINDOW_S
+        best, bdt = None, window
         for q in idx.get(key(p), []):
             if q["id"] in used:
                 continue
@@ -238,12 +453,16 @@ def bearing_deg(a, b):
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
-def geo_build(pos_a, pos_b, neighbours, adverts):
+def geo_build(pos_a, pos_b, neighbours, adverts, co=False):
     """Place the neighbours around the two radios. A hop hash is the first 1-3 bytes of the node's public
-    key, so a hop is placed when the adverts with a position whose pubkey starts with it all agree."""
+    key, so a hop is placed when the adverts with a position whose pubkey starts with it all agree.
+
+    Two radios on one system stand at one point (`co`): every distance is then the same on both sides, so
+    the section stops being about geography and becomes about what the two antennas see from that point."""
     hops = [n["hop"] for n in neighbours if n["hop"] != "direct"]
     if not pos_a and not pos_b:
-        return {"a": None, "b": None, "mid": None, "apart": NAN, "nb": [], "unplaced": hops, "ambiguous": [], "adverts": len(adverts)}
+        return {"a": None, "b": None, "mid": None, "apart": NAN, "nb": [], "unplaced": hops, "ambiguous": [],
+                "adverts": len(adverts), "co": co}
     pos_a, pos_b = pos_a or pos_b, pos_b or pos_a   # one radio without a position sits at the other's
     mid = ((pos_a[0] + pos_b[0]) / 2, (pos_a[1] + pos_b[1]) / 2)
     placed, unplaced, ambiguous = [], [], []
@@ -259,8 +478,8 @@ def geo_build(pos_a, pos_b, neighbours, adverts):
         ll = (d["lat"], d["lon"])
         placed.append({"hop": hop, "name": d["name"], "ll": ll, "d": haversine_km(mid, ll), "brg": bearing_deg(mid, ll),
                        "da": haversine_km(pos_a, ll), "db": haversine_km(pos_b, ll)})
-    return {"a": pos_a, "b": pos_b, "mid": mid, "apart": haversine_km(pos_a, pos_b), "nb": placed,
-            "unplaced": unplaced, "ambiguous": ambiguous, "adverts": len(adverts)}
+    return {"a": pos_a, "b": pos_b, "mid": mid, "apart": 0.0 if co else haversine_km(pos_a, pos_b), "nb": placed,
+            "unplaced": unplaced, "ambiguous": ambiguous, "adverts": len(adverts), "co": co}
 
 
 def mean(xs):
@@ -272,6 +491,11 @@ def med(xs):
 
 
 def analyze(A, B, hours):
+    """Compare two receivers over the last `hours`. A receiver is one radio, or a whole system with its
+    radios folded together; when both sit on the same system (`co` below) they share a clock, a position,
+    a repeater mode and a noise floor, and the analyses that exist to tell those apart are skipped."""
+    co = A.cosited(B)
+    win = SAME_SITE_WINDOW_S if co else MATCH_WINDOW_S
     end = time.time()
     start = end - hours * 3600
     (pa, own_a), (pb, own_b) = A.packets(start, end), B.packets(start, end)
@@ -291,18 +515,25 @@ def analyze(A, B, hours):
             else:
                 keep.append(p)
         return keep, heard
-    pa, heard_a = strip_sent_by_other(pa, tx_b)   # heard_a: B's transmissions A picked up
-    pb, heard_b = strip_sent_by_other(pb, tx_a)
-    tx = {"A": {"mode": A.mode(), "sent": len(tx_a), "heard_by_other": heard_b},
+    if co:
+        # one box: what it sent, it sent on both radios' behalf, and openHop already files the loopback
+        # row as own (rssi 0) on whichever radio was idle. There is no "the other node heard me" here.
+        heard_a = heard_b = 0
+    else:
+        pa, heard_a = strip_sent_by_other(pa, tx_b)   # heard_a: B's transmissions A picked up
+        pb, heard_b = strip_sent_by_other(pb, tx_a)
+    tx = {"co": co,
+          "A": {"mode": A.mode(), "sent": len(tx_a), "heard_by_other": heard_b},
           "B": {"mode": B.mode(), "sent": len(tx_b), "heard_by_other": heard_a}}
-    # only compare the period where both nodes were actually listening
+    # only compare the period where both receivers were actually listening. For a radio this also skips
+    # past the part of the window that predates multiradio, where no row carries a radio id at all.
     if pa and pb:
         overlap = max(min(p["timestamp"] for p in pa), min(p["timestamp"] for p in pb))
         if overlap - start > 60:
             pa = [p for p in pa if p["timestamp"] >= overlap]
             pb = [p for p in pb if p["timestamp"] >= overlap]
             start = overlap
-    pairs, only_a, only_b = match(pa, pb)
+    pairs, only_a, only_b = match(pa, pb, win)
     h = max(1, int(math.ceil(hours)))
     na, nb = A.noise(h), B.noise(h)
     na = [x for x in na if x[0] >= start]; nb = [x for x in nb if x[0] >= start]
@@ -426,7 +657,7 @@ def analyze(A, B, hours):
     # where the neighbours are: positions from their own adverts (either node may have heard them), the
     # radios' positions from openHop
     adverts = advert_store(A.adverts(max(hours, ADVERT_LOOKBACK_H)), B.adverts(max(hours, ADVERT_LOOKBACK_H)))
-    geo = geo_build(A.position(), B.position(), neighbours, adverts)
+    geo = geo_build(A.position(), B.position(), neighbours, adverts, co)
 
     return {
         "generated": time.time(), "start": start, "end": end, "bucket": bucket,
@@ -436,7 +667,8 @@ def analyze(A, B, hours):
               "noise": nb, "crc": sum(c for _, c in cb), "crc_lower_bound": bool(crc_trunc["B"]), "crc_hist": cb},
         "pairs": pairs, "drssi": drssi, "dsnr": dsnr, "neighbours": neighbours, "buckets": buckets,
         "types": types, "curves": curves, "dsnr_by_level": dsnr_by_level, "by_type": by_type, "clock": clock,
-        "one_sided": one_sided, "geo": geo, "canon": canon, "tx": tx,
+        "one_sided": one_sided, "geo": geo, "canon": canon, "tx": tx, "co": co, "window": win,
+        "ids": {"A": A.id, "B": B.id},
         "shared": {"pairs": len(sh_pairs), "only_a": len(sh_only_a), "only_b": len(sh_only_b),
                    "deep_a": sum(1 for p, _ in sh_pairs if p["snr"] + shift["a"] < DEEP_DB) + sum(1 for p in sh_only_a if p["snr"] + shift["a"] < DEEP_DB),
                    "deep_b": sum(1 for _, q in sh_pairs if q["snr"] + shift["b"] < DEEP_DB) + sum(1 for q in sh_only_b if q["snr"] + shift["b"] < DEEP_DB)},
@@ -488,6 +720,8 @@ def print_report(R):
               f"{fmt(mean(n['snr']),8,2)} {fmt(med(n['snr']),8,2)} {fmt(fs['snr_min'],8,1)} {fs['deep']:7d} {fmt(mean(nz),10)} {fmt(min(nz) if nz else NAN,10)} {n['crc']:8d}")
     print("  decoded = share of every transmission at least one node heard. SNR min and <-8dB are on the common SNR scale.")
     print("  RSSI and noise floor are calibrated differently per radio: compare SNR, not RSSI.")
+    if R.get("co"):
+        print("  Both rows are radios on one system: noise floor and CRC errors are reported per system, so they read the same on both.")
     print("-" * 96)
     if pairs:
         better_b = sum(1 for d in dsnr if d > 0); better_a = sum(1 for d in dsnr if d < 0)
@@ -505,8 +739,12 @@ def print_report(R):
             lbl = f"{'<=' if d == -10 else '>=' if d == 10 else ''}{d:+d}"
             print(f"    {lbl:>5} {'#' * max(1, round(60 * hist[d] / top))} {hist[d]}")
         ck = R["clock"]
-        print(f"  clocks: B stamps the same packet {ck['median']:+.2f} s relative to A (5th-95th pct {ck['p5']:+.2f}..{ck['p95']:+.2f} s, "
-              f"max |dt| {ck['max_abs']:.2f} s of a {MATCH_WINDOW_S:g} s window); {ck['wild']} pairs differ by more than 10 dB")
+        if R.get("co"):
+            print(f"  one clock (both radios on the same system): rows for a packet land {1000*abs(ck['median']):.0f} ms apart, "
+                  f"max {1000*ck['max_abs']:.0f} ms of a {1000*R['window']:.0f} ms window; {ck['wild']} pairs differ by more than 10 dB")
+        else:
+            print(f"  clocks: B stamps the same packet {ck['median']:+.2f} s relative to A (5th-95th pct {ck['p5']:+.2f}..{ck['p95']:+.2f} s, "
+                  f"max |dt| {ck['max_abs']:.2f} s of a {R['window']:g} s window); {ck['wild']} pairs differ by more than 10 dB")
     print("-" * 96)
     for n in (A, B):
         only = n["only"]
@@ -1450,19 +1688,32 @@ def build_reading(R, H):
         who = lambda n: na if heard_share(n)[0] > heard_share(n)[1] else nb
         reading.append(f"<b>{len(one_sided)} neighbour{'s are' if len(one_sided) > 1 else ' is'} heard almost only by one node</b>: "
                        + ", ".join(f"{esc(n['hop'])} by {esc(who(n))} ({100*max(heard_share(n)):.0f}% vs {100*min(heard_share(n)):.0f}%)" for n in one_sided)
-                       + ". A receiver difference would show on every neighbour; a neighbour only one node hears comes from where that node sits "
-                       + (f"— and the radios are {R['geo']['apart']:.1f} km apart, so this is expected. See <a href=\"#geo\">where the neighbours are</a>."
+                       + ". A receiver difference would show on every neighbour; a neighbour only one side hears comes from "
+                       + ("what that radio's antenna sees from the one mast they share (pattern, downtilt, a wall or roof edge in the way) "
+                          "rather than from its sensitivity. Swap the antennas between the radios to confirm."
+                          if R.get("co") else
+                          f"where that node sits — and the radios are {R['geo']['apart']:.1f} km apart, so this is expected. See <a href=\"#geo\">where the neighbours are</a>."
                           if R["geo"]["mid"] and R["geo"]["apart"] > 1 else
-                          "(multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm."))
+                          "where that node sits (multipath nulls, obstruction, antenna orientation). Swap the boards between positions to confirm."))
     return reading
 
 
 def tx_note(R):
-    """One sentence on whether the nodes kept quiet — the premise of the comparison. (html, warn)."""
+    """One sentence on whether the receivers kept quiet — the premise of the comparison. (html, warn)."""
     A, B, tx = R["A"], R["B"], R.get("tx") or {}
     ta, tb = tx.get("A", {}), tx.get("B", {})
     na, nb = esc(A["name"]), esc(B["name"])
     mode = lambda t: t["mode"].replace("_", "-") if t.get("mode") else "unknown"
+    if R.get("co"):
+        # both receivers are radios on one system: it has one repeater mode and one count of what it
+        # sent, and while it sends it is deaf on both radios at once — which cancels out of the comparison.
+        sent = ta.get("sent") or 0
+        if not sent:
+            return (f"The system sent nothing in this window ({mode(ta)} mode), so the share of the traffic each radio "
+                    f"decoded is a clean receive comparison; SNR on shared packets explains it."), False
+        return (f"<b>The system sent {sent:,} packet{'s' if sent != 1 else ''}</b> ({mode(ta)} mode), left out on both sides. "
+                f"It is deaf on both radios while it sends, so that much falls on the two equally and the comparison "
+                f"survives it; no-TX mode is still the clean setup. SNR on shared packets explains the rest."), False
     if not (ta.get("sent") or tb.get("sent")):
         modes = (f" — {na} is in {mode(ta)} mode, {nb} in {mode(tb)} —"
                  if (ta.get("mode") or tb.get("mode")) and not (ta.get("mode") == tb.get("mode") == "no_tx") else "")
@@ -1661,7 +1912,7 @@ def render_html(R, nav="", refresh=0):
     else:
         geo_section = f"""<section id="geo">
 <h2>Where the neighbours are{info("geo")}</h2>
-<p class="meta">Every upstream neighbour whose advert carried a position, placed around the two radios ({1000*g['apart']:.0f} m apart). Each circle is filled left to right with the share of its transmissions each node decodes — half and half is level, all one colour is one-sided; size is how many packets that rests on.
+<p class="meta">Every upstream neighbour whose advert carried a position, placed around {"the system both radios sit on — one point, so every distance below is the same for the two of them" if R.get("co") else f"the two radios ({1000*g['apart']:.0f} m apart)"}. Each circle is filled left to right with the share of its transmissions each node decodes — half and half is level, all one colour is one-sided; size is how many packets that rests on.
 {"The radios are far enough apart that each neighbour is closer to one of them, so the split is geography; the receivers are compared with distance taken out, below." if far else "A pattern by <em>direction</em> is the mast, the antenna or something in the way — not the receiver."}</p>
 <div class="ctl" style="margin:0 0 14px;font-size:13px;color:var(--ink2)">Split by<span class="seg" role="group"><button class="on" data-cb="rate">Decode rate</button><button data-cb="snr">SNR</button></span></div>
 <div class="grid2">
@@ -1688,11 +1939,18 @@ def render_html(R, nav="", refresh=0):
     # ---- match quality
     ck = R["clock"]
     if npair:
-        tight = abs(ck["p95"]) < 0.5 * MATCH_WINDOW_S and abs(ck["p5"]) < 0.5 * MATCH_WINDOW_S
-        clock_note = (f'<p class="meta{"" if tight else " warn"}">Clocks: {esc(nb)} stamps the same packet {signed(ck["median"], ".2f")} s relative to {esc(na)} '
-                      f'(5th–95th pct {signed(ck["p5"], ".2f")}…{signed(ck["p95"], ".2f")} s, max |Δt| {ck["max_abs"]:.2f} s against a {MATCH_WINDOW_S:g} s window'
-                      + ("" if tight else " — close to the window; drift would turn matches into exclusives") + f'). '
-                      f'{ck["wild"]} pair{"s" if ck["wild"] != 1 else ""} ({100*ck["wild"]/npair:.1f}%) differ by more than 10 dB, usually a collision at one node.</p>')
+        win_s = R.get("window", MATCH_WINDOW_S)
+        tight = abs(ck["p95"]) < 0.5 * win_s and abs(ck["p5"]) < 0.5 * win_s
+        if R.get("co"):
+            clock_note = (f'<p class="meta">Both radios sit on one system and read one clock, so there is no offset to correct: '
+                          f'its two rows for a packet land {1000*abs(ck["median"]):.0f} ms apart (max {1000*ck["max_abs"]:.0f} ms, '
+                          f'against a {1000*win_s:.0f} ms match window). '
+                          f'{ck["wild"]} pair{"s" if ck["wild"] != 1 else ""} ({100*ck["wild"]/npair:.1f}%) differ by more than 10 dB, usually a collision on one radio.</p>')
+        else:
+            clock_note = (f'<p class="meta{"" if tight else " warn"}">Clocks: {esc(nb)} stamps the same packet {signed(ck["median"], ".2f")} s relative to {esc(na)} '
+                          f'(5th–95th pct {signed(ck["p5"], ".2f")}…{signed(ck["p95"], ".2f")} s, max |Δt| {ck["max_abs"]:.2f} s against a {win_s:g} s window'
+                          + ("" if tight else " — close to the window; drift would turn matches into exclusives") + f'). '
+                          f'{ck["wild"]} pair{"s" if ck["wild"] != 1 else ""} ({100*ck["wild"]/npair:.1f}%) differ by more than 10 dB, usually a collision at one node.</p>')
     else:
         clock_note = ""
 
@@ -1704,7 +1962,7 @@ def render_html(R, nav="", refresh=0):
 <title>RX compare: {esc(na)} vs {esc(nb)}</title>{f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''}<style>{CSS}</style></head><body><main>
 <h1 class="who"><span class="node a"><span class="chip">A</span>{esc(na)}</span><span class="vs">vs</span><span class="node b"><span class="chip">B</span>{esc(nb)}</span></h1>
 <p class="meta">Receive comparison for {time.strftime('%H:%M', time.localtime(R['start']))}–{time.strftime('%H:%M', time.localtime(R['end']))} on {time.strftime('%Y-%m-%d', time.localtime(R['start']))} ({span_h:.1f} h), generated {time.strftime('%H:%M:%S')}.
-A transmission counts as matched when both nodes log the same packet hash and path within {MATCH_WINDOW_S:g} s. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
+A transmission counts as matched when both receivers log the same packet hash and path within {R.get("window", MATCH_WINDOW_S):g} s{" — one system, one clock, so the rows are milliseconds apart" if R.get("co") else ""}. Deltas are B&nbsp;−&nbsp;A, so positive means {esc(nb)} did better.</p>
 <p class="meta{' warn' if tx_warn else ''}">{tx_text}</p>
 <nav class="topbar"><div class="jump"><a href="#overview">Overview</a><a href="#missed">Missed</a><a href="#sensitivity">Sensitivity</a><a href="#matched">Matched</a><a href="#neighbours">Neighbours</a><a href="#geo">Map</a><a href="#explore">Explore</a><a href="#time">Over time</a><a href="#data">Data</a></div>{nav}</nav>
 
@@ -1770,7 +2028,7 @@ A transmission counts as matched when both nodes log the same packet hash and pa
 <div class="card"><h3>Packets decoded per {R['bucket']//60} min</h3><p>Matched and exclusive packets together. {partial}</p>{leg}{cnt_chart}</div>
 <div class="card"><h3>Decode rate per {R['bucket']//60} min</h3><p>Each node's share of the transmissions at least one of them decoded in that bucket. Shows whether the gap is steady or comes with traffic bursts or noise.</p>{leg}{rate_chart}</div>
 <div class="card"><h3>Mean Δ SNR per {R['bucket']//60} min, B − A</h3><p>Should be flat. A drift points at a temperature, hardware or interference change on one side.</p>{dsnr_chart}</div>
-<div class="card"><h3>Noise floor, dBm{info("noise")}</h3><p>Each node's own measurement. The offset between them is partly RSSI calibration.</p>{leg}{noise_chart}</div>
+<div class="card"><h3>Noise floor, dBm{info("noise")}</h3><p>{"openHop reports one noise floor per system, so both radios read the same line here." if R.get("co") else "Each node&#39;s own measurement. The offset between them is partly RSSI calibration."}</p>{leg}{noise_chart}</div>
 <div class="card"><h3>Packets decoded below {signed(DEEP_DB)} dB per {R['bucket']//60} min{info("scale")}</h3><p>The floor stat over time, on the common SNR scale. If one node's line sinks while the other's holds, its front end got noisier. {partial}</p>{leg}{deep_chart}</div>
 <div class="card"><h3>CRC errors per {R['bucket']//60} min{info("crc")}</h3><p>Preambles detected but not decoded: packets at the edge, or false detections in noise. Read with the chart on the left — more CRC errors <em>and</em> fewer deep decodes points at a noisier front end. {partial}</p>{leg}{crc_chart}</div>
 </div>
@@ -1826,6 +2084,7 @@ def summary(R):
                 **floor_stats(n, sh_)}
     union = len(R["pairs"]) + len(A["only"]) + len(B["only"])
     d = {"generated": R["generated"], "start": R["start"], "end": R["end"], "matched": len(R["pairs"]), "union": union,
+         "receivers": R.get("ids"), "cosited": R.get("co", False), "match_window_s": R.get("window"),
          "one_sided_neighbours": R["one_sided"], "shared_neighbours": R["shared"], "geo": R["geo"], "tx": R.get("tx"),
          "clock": R["clock"], "decode_curves": R["curves"], "dsnr_by_level": R["dsnr_by_level"], "by_type": R["by_type"],
          "A": side(A), "B": side(B),
@@ -1846,17 +2105,32 @@ def main():
     ap.add_argument("--csv", metavar="FILE", help="write matched pairs")
     ap.add_argument("--html", metavar="FILE", help="write an HTML report")
     ap.add_argument("--quiet", action="store_true", help="skip the text report")
+    ap.add_argument("--config", metavar="FILE", help="receiver registry (YAML/JSON); default receivers.yml, else the A_*/B_* env vars")
+    ap.add_argument("--a", metavar="ID", help='receiver to compare, e.g. "heltec:local" (a bare site id means all its radios)')
+    ap.add_argument("--b", metavar="ID", help="the other receiver")
+    ap.add_argument("--list", action="store_true", help="list the receivers on offer and exit")
     for s in "ab":
-        ap.add_argument(f"--{s}-url", default=os.environ.get(f"{s.upper()}_URL"))
-        ap.add_argument(f"--{s}-key", default=os.environ.get(f"{s.upper()}_KEY"))
-        ap.add_argument(f"--{s}-name", default=os.environ.get(f"{s.upper()}_NAME", s.upper()))
-        ap.add_argument(f"--{s}-lat", default=os.environ.get(f"{s.upper()}_LAT"), help="override the position openHop reports")
+        ap.add_argument(f"--{s}-url", default=os.environ.get(f"{s.upper()}_URL"), help=argparse.SUPPRESS)
+        ap.add_argument(f"--{s}-key", default=os.environ.get(f"{s.upper()}_KEY"), help=argparse.SUPPRESS)
+        ap.add_argument(f"--{s}-name", default=os.environ.get(f"{s.upper()}_NAME", s.upper()), help=argparse.SUPPRESS)
+        ap.add_argument(f"--{s}-lat", default=os.environ.get(f"{s.upper()}_LAT"), help=argparse.SUPPRESS)
         ap.add_argument(f"--{s}-lon", default=os.environ.get(f"{s.upper()}_LON"))
     args = ap.parse_args()
-    if not all((args.a_url, args.a_key, args.b_url, args.b_key)):
-        sys.exit("need A_URL/A_KEY/B_URL/B_KEY (env or flags)")
-    A = Node(args.a_name, args.a_url, args.a_key, args.a_lat, args.a_lon)
-    B = Node(args.b_name, args.b_url, args.b_key, args.b_lat, args.b_lon)
+    # the old two-node flags still work: they stand in for the A_*/B_* variables, which load_sites()
+    # falls back to when there is no registry file (the file wins when there is one)
+    for s in "ab":
+        for k in ("url", "key", "name", "lat", "lon"):
+            v = getattr(args, f"{s}_{k}")
+            if v:
+                os.environ[f"{s.upper()}_{k.upper()}"] = str(v)
+    sites, default = load_sites(args.config)
+    if not sites:
+        sys.exit("no receivers configured: write a receivers.yml (see receivers.example.yml) or set A_URL/A_KEY/B_URL/B_KEY")
+    if args.list:
+        for rid, rv in receivers_of(sites).items():
+            print(f"{rid:28} {rv.name}")
+        return
+    A, B = pick_receivers(sites, args.a, args.b, default)
     while True:
         try:
             R = analyze(A, B, args.hours)

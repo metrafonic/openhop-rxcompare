@@ -3,3 +3,5 @@ report.html
 *.csv
 __pycache__/
 *.pyc
+receivers.yml
+receivers.json

@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source=https://github.com/metrafonic/openhop-rxcompare
 WORKDIR /app
-COPY rxcompare.py server.py ./
+# the only dependency, and only for reading receivers.yml — a receivers.json needs nothing
+RUN pip install --no-cache-dir pyyaml==6.0.2
+COPY rxcompare.py server.py receivers.example.yml ./
 ENV PYTHONUNBUFFERED=1 PORT=8080 ADVERT_CACHE=/data/adverts.json
 EXPOSE 8080
 RUN useradd -r -u 10001 app && mkdir /data && chown app /data

@@ -1,0 +1,33 @@
+# The receivers to compare. One entry per openHop system; its radios are discovered from the API, so a
+# multiradio box offers one receiver per radio plus one for the box as a whole (all radios folded
+# together, each transmission counted once however many of them heard it).
+#
+# Copy to receivers.yml. Two are compared at a time — the report's A and B rows pick which two, and the
+# decode rate is always "of every transmission either of these two heard", so the numbers stay
+# comparable whatever else is configured or offline.
+#
+# Keys stay out of this file: ${VAR} is read from the environment (docker compose passes .env through).
+# Reading YAML needs PyYAML, which the Docker image has; the same structure as receivers.json works
+# without it.
+
+sites:
+  - id: heltec                                  # short, stable; the receiver ids are built from it
+    label: Heltec V4                            # what the report calls it
+    url: https://openhop.home.hedberg.io
+    key: ${HELTEC_KEY}
+    # radios are discovered, so this is only for naming them something better than "local"/"link"
+    radios:
+      local: Onboard SX1262
+      link: 1W link radio
+
+  - id: rak
+    label: RAK 1W
+    url: http://192.168.2.207:8000
+    key: ${RAK_KEY}
+    # openHop reports each system's own position (manual config or GPS fix); set these to override it
+    #lat: 59.9697
+    #lon: 10.6414
+
+# Which two to open with. Omit to take the first two on offer.
+# A bare site id means that whole system; site:radio means the one radio.
+default: [heltec:local, heltec:link]

@@ -2,16 +2,18 @@
 """Tiny web app around rxcompare: refreshes the comparison in the background and serves it.
 
 Routes:
-  /                 HTML report (default window HOURS; ?hours=N for another range)
-  /summary.json     compact JSON of the same result (?hours=N)
+  /                 HTML report (default receiver pair and window; ?a=&b=&hours=N for others)
+  /summary.json     compact JSON of the same result (same query parameters)
+  /receivers.json   the receivers on offer — one per radio of each system, plus each system as a whole
   /healthz          200 once the first analysis has succeeded
 
-Config via environment (see .env.example): A_URL A_KEY A_NAME B_URL B_KEY B_NAME
-HOURS REFRESH_SEC PORT VERIFY_TLS RANGES, plus the map settings in rxcompare.py
+Receivers come from receivers.yml (RECEIVERS to point elsewhere); with no such file the A_*/B_* env
+vars are used, which is the two-node setup this started as. Other config: HOURS REFRESH_SEC PORT
+VERIFY_TLS RANGES, plus the map settings in rxcompare.py
 """
 import html, json, os, sys, threading, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import rxcompare as rx
 
@@ -21,11 +23,10 @@ PORT = int(os.environ.get("PORT", "8080"))
 RANGES = [float(x) for x in os.environ.get("RANGES", "1,3,6,12,24,48").split(",")]
 MAX_HOURS = 168.0
 
-A = rx.Node(os.environ.get("A_NAME", "A"), os.environ.get("A_URL", ""), os.environ.get("A_KEY", ""), os.environ.get("A_LAT"), os.environ.get("A_LON"))
-B = rx.Node(os.environ.get("B_NAME", "B"), os.environ.get("B_URL", ""), os.environ.get("B_KEY", ""), os.environ.get("B_LAT"), os.environ.get("B_LON"))
+SITES, DEFAULT = rx.load_sites()
 
-_cache = {}          # hours -> {"ts", "html", "summary"}
-_locks = {}          # hours -> Lock, so concurrent requests don't both hit the repeaters
+_cache = {}          # (a, b, hours) -> {"ts", "html", "summary"}
+_locks = {}          # same key -> Lock, so concurrent requests don't both hit the receivers
 _locks_guard = threading.Lock()
 _last_error = None
 
@@ -34,30 +35,62 @@ def log(*a):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
-def nav_html(hours):
-    links = "".join(f'<a href="/?hours={h:g}" class="{"on" if h == hours else ""}">{h:g} h</a>' for h in RANGES)
-    return (f'<div class="nav">{links}<a href="/summary.json?hours={hours:g}">json</a>'
-            f'<span style="align-self:center;color:var(--muted);font-size:12px;margin-left:6px">data refreshes every {REFRESH // 60} min — reload for the latest</span></div>')
+def registry():
+    """id -> Receiver. Discovery is cached in the Site objects, so this is cheap after the first call."""
+    return rx.receivers_of(SITES)
 
 
-def compute(hours):
+def default_pair():
+    reg = registry()
+    ids = [i for i in (DEFAULT or ()) if i in reg] if DEFAULT else []
+    return tuple(ids[:2]) if len(ids) >= 2 else tuple(list(reg)[:2])
+
+
+def nav_html(a, b, hours):
+    """Range links, plus a row per side to pick which receiver it is. Anything not being changed is
+    carried through, so switching one side keeps the other and the window."""
+    reg = registry()
+    out = []
+    if len(reg) > 2:
+        for side, cur, other in (("A", a, b), ("B", b, a)):
+            links = "".join(
+                f'<a href="/?{urlencode({"a": rid if side == "A" else other, "b": other if side == "A" else rid, "hours": f"{hours:g}"})}"'
+                f' class="{"on" if rid == cur else ""}">{html.escape(rv.name)}</a>'
+                for rid, rv in reg.items() if rid != other)
+            out.append(f'<div class="nav"><span style="align-self:center;color:var(--muted);font-size:12px;'
+                       f'min-width:14px;font-weight:600">{side}</span>{links}</div>')
+    ranges = "".join(f'<a href="/?{urlencode({"a": a, "b": b, "hours": f"{h:g}"})}" class="{"on" if h == hours else ""}">{h:g} h</a>'
+                     for h in RANGES)
+    out.append(f'<div class="nav">{ranges}<a href="/summary.json?{urlencode({"a": a, "b": b, "hours": f"{hours:g}"})}">json</a>'
+               f'<span style="align-self:center;color:var(--muted);font-size:12px;margin-left:6px">'
+               f'data refreshes every {REFRESH // 60} min — reload for the latest</span></div>')
+    return "".join(out)
+
+
+def compute(a, b, hours):
     global _last_error
+    key = (a, b, hours)
     with _locks_guard:
-        lock = _locks.setdefault(hours, threading.Lock())
+        lock = _locks.setdefault(key, threading.Lock())
     with lock:
-        ent = _cache.get(hours)
+        ent = _cache.get(key)
         if ent and time.time() - ent["ts"] < REFRESH:
             return ent
+        reg = registry()
+        for i in (a, b):
+            if i not in reg:
+                raise KeyError(f"unknown receiver {i!r}; available: {', '.join(reg)}")
         t = time.time()
         try:
-            R = rx.analyze(A, B, hours)
-            ent = {"ts": time.time(), "html": rx.render_html(R, nav_html(hours)), "summary": rx.summary(R)}
-            _cache[hours] = ent
+            R = rx.analyze(reg[a], reg[b], hours)
+            ent = {"ts": time.time(), "html": rx.render_html(R, nav_html(a, b, hours)), "summary": rx.summary(R)}
+            _cache[key] = ent
             _last_error = None
-            log(f"analysed {hours:g}h: {len(R['pairs'])} matched, {R['A']['n']}/{R['B']['n']} packets, {time.time()-t:.1f}s")
+            log(f"analysed {a} vs {b} over {hours:g}h: {len(R['pairs'])} matched, "
+                f"{R['A']['n']}/{R['B']['n']} packets, {time.time()-t:.1f}s")
             return ent
         except Exception as e:
-            _last_error = f"{type(e).__name__}: {e}"
+            _last_error = f"{a} vs {b} {hours:g}h: {type(e).__name__}: {e}"
             log("analysis failed:", _last_error)
             traceback.print_exc()
             if ent:          # serve stale rather than nothing
@@ -68,7 +101,9 @@ def compute(hours):
 def refresher():
     while True:
         try:
-            compute(HOURS)
+            a, b = default_pair()
+            if a and b:
+                compute(a, b, HOURS)
         except Exception:
             pass
         time.sleep(REFRESH)
@@ -94,6 +129,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return HOURS
 
+    def pair(self, q):
+        da, db = default_pair()
+        a, b = q.get("a", [da])[0], q.get("b", [db])[0]
+        return a, b
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -101,13 +141,25 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/healthz":
-            ent = _cache.get(HOURS)
+            ent = _cache.get((*default_pair(), HOURS))
             return self.send(200 if ent else 503, json.dumps({"ok": bool(ent), "last_error": _last_error,
                                                             "age_s": time.time() - ent["ts"] if ent else None}),
                              "application/json")
+        if u.path == "/receivers.json":
+            reg = registry()
+            return self.send(200, json.dumps({"default": list(default_pair()),
+                                              "receivers": [{"id": i, "name": r.name, "site": r.site.id,
+                                                             "radio": r.radio, "url": r.url} for i, r in reg.items()]},
+                                             indent=1), "application/json")
         if u.path in ("/", "/index.html", "/summary.json"):
+            a, b = self.pair(q)
+            if not (a and b):
+                return self.send(503, "<h1>no receivers configured</h1><p>Write a receivers.yml "
+                                      "(see receivers.example.yml) or set A_URL/A_KEY/B_URL/B_KEY.</p>")
+            if a == b:
+                return self.send(400, f"<h1>pick two different receivers</h1><pre>{html.escape(a)}</pre>")
             try:
-                ent = compute(self.hours(q))
+                ent = compute(a, b, self.hours(q))
             except Exception as e:
                 return self.send(502, f"<h1>analysis failed</h1><pre>{html.escape(str(e))}</pre>")
             if u.path == "/summary.json":
@@ -117,11 +169,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not (A.url and A.key and B.url and B.key):
-        sys.exit("A_URL, A_KEY, B_URL, B_KEY must be set (copy .env.example to .env)")
+    if not SITES:
+        sys.exit("no receivers configured: write a receivers.yml (see receivers.example.yml) "
+                 "or set A_URL/A_KEY/B_URL/B_KEY")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"serving on :{PORT}  A={A.name} {A.url}  B={B.name} {B.url}  window={HOURS:g}h refresh={REFRESH}s")
+    a, b = default_pair()
+    log(f"serving on :{PORT}  sites={', '.join(s.id for s in SITES)}  default={a} vs {b}  "
+        f"window={HOURS:g}h refresh={REFRESH}s")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

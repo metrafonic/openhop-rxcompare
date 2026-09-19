@@ -2,13 +2,16 @@
 
 [![docker](https://github.com/metrafonic/openhop-rxcompare/actions/workflows/docker.yml/badge.svg)](https://github.com/metrafonic/openhop-rxcompare/actions/workflows/docker.yml)
 
-Compare the receive performance of two openHop LoRa repeaters
-listening on the same channel — e.g. two different boards or antennas installed side by
-side, both in no-TX mode (monitor mode works too: the node's own adverts and requests are
-taken out of the comparison, and the report says how many there were).
+Compare the receive performance of two openHop LoRa receivers listening on the same channel —
+two boards or antennas installed side by side, or **two radios on one multiradio system** — in
+no-TX mode (monitor mode works too: the node's own adverts and requests are taken out of the
+comparison, and the report says how many there were).
 
-It pulls packet history from each node's openHop API, joins the packets that both nodes
-heard (same `packet_hash` + `path_hash` within 3 s), and reports:
+A *receiver* is one radio of one openHop system, or a whole system with its radios folded
+together. Configure any number of systems; the report compares two receivers at a time and lets
+you switch either side. It pulls packet history from each system's openHop API, joins the packets
+both receivers heard (same `packet_hash` + `path_hash` within 3 s — or 250 ms for two radios on
+one box, which share a clock), and reports:
 
 - **decode rate** (the headline — neither node transmits, so this is a clean receive comparison):
   of every transmission at least one node heard, the share each node decoded,
@@ -94,6 +97,19 @@ docker compose up -d
 open http://localhost:8090
 ```
 
+That is the two-node setup. For more systems, or to compare the radios of a multiradio one
+separately, list them in a `receivers.yml` and mount it (the line is in `docker-compose.yml`):
+
+```sh
+cp receivers.example.yml receivers.yml   # one entry per system; keys stay in .env as ${VAR}
+# uncomment the receivers.yml volume in docker-compose.yml
+docker compose up -d
+```
+
+Each system's radios are discovered from its API (openHop tags every reception with
+`rx_radio_id`), so a multiradio box offers one receiver per radio plus one for the box as a
+whole. The report's nav gains an A row and a B row to pick which two to compare.
+
 To build the image yourself instead of pulling it:
 
 ```sh
@@ -105,32 +121,46 @@ Routes:
 
 | path | what |
 |---|---|
-| `/` | report for the default window (`HOURS`); `/?hours=24` for another range |
-| `/summary.json` | the same numbers as JSON (`?hours=` works here too) |
+| `/` | report for the default pair and window; `/?a=heltec:local&b=rak&hours=24` for another |
+| `/summary.json` | the same numbers as JSON (same query parameters) |
+| `/receivers.json` | the receivers on offer and the default pair |
 | `/healthz` | 200 once the first analysis succeeded |
 
-The default window is refreshed every `REFRESH_SEC` in the background; other ranges are
-computed on demand and cached for the same period.
+The default pair and window are refreshed every `REFRESH_SEC` in the background; other pairs and
+ranges are computed on demand and cached for the same period. Two radios on one system share one
+fetch of its packet history.
 
 ## Run without Docker
 
-Needs only Python 3.10+, no third-party packages.
+Needs Python 3.10+ and, only for reading a `receivers.yml`, PyYAML (`pip install pyyaml`); a
+`receivers.json` of the same shape, or the `A_*`/`B_*` variables, need nothing.
 
 ```sh
 set -a; . ./.env; set +a
 python3 server.py                                 # web app on $PORT (default 8080)
-python3 rxcompare.py --hours 6                    # text report
+python3 rxcompare.py --list                       # the receivers on offer
+python3 rxcompare.py --hours 6                    # text report, default pair
+python3 rxcompare.py --a heltec:local --b heltec:link --hours 6   # two radios on one system
 python3 rxcompare.py --hours 6 --html report.html --csv pairs.csv
 python3 rxcompare.py --watch 300 --html report.html   # regenerate every 5 min
 ```
 
 ## Configuration
 
-All settings are environment variables — see [`.env.example`](.env.example).
+Receivers come from [`receivers.example.yml`](receivers.example.yml) (copied to `receivers.yml`,
+or pointed at with `RECEIVERS=`): per system an `id`, `label`, `url`, `key` (use `${VAR}` to read
+it from the environment), optional `lat`/`lon` override and optional labels for its radios, plus a
+`default` pair such as `[heltec:local, rak]`. A bare site id means the whole system, `site:radio`
+one radio. With no such file the `A_*`/`B_*` variables below describe two systems of one receiver
+each — a multiradio system there still has its duplicate decodes folded together, you just cannot
+pick its radios apart.
+
+Everything else is an environment variable — see [`.env.example`](.env.example).
 
 | var | meaning |
 |---|---|
-| `A_URL`, `A_KEY`, `A_NAME` | node A base URL, API key (`X-API-Key`), display name |
+| `RECEIVERS` | path to the receiver registry (default: `receivers.yml`/`.yaml`/`.json` in the working directory) |
+| `A_URL`, `A_KEY`, `A_NAME` | node A base URL, API key (`X-API-Key`), display name — used when there is no registry file |
 | `B_URL`, `B_KEY`, `B_NAME` | node B |
 | `HOURS` | default comparison window (default 3) |
 | `REFRESH_SEC` | background refresh / cache lifetime (default 300) |
@@ -149,15 +179,28 @@ API keys are created in the openHop web UI under *Sessions → API tokens*.
 
 ## How the comparison works
 
-Both nodes log every packet they decode with RSSI and SNR. Packets a node originated itself (its
-adverts, openHop's own requests, a companion app's traffic) sit in the same log with RSSI 0 and
-are not receptions; they are dropped, and when the node did send one, the other node's direct
-copy of it (same hash within 3 s, no upstream hop) is dropped too, since the sender could not
-have heard it. The report says how many such packets there were. A transmission is identified by
-`(packet_hash, path_hash)` — the same payload relayed by two different neighbours is two
-different transmissions — and matched across nodes when the timestamps are within 3 s.
-The comparison window is clamped to the period where both nodes have data, so a restart on
-one side doesn't count as missed packets.
+Every system logs every packet it decodes with RSSI and SNR, and on a multiradio build, with
+the radio that decoded it (`rx_radio_id`): one transmission heard by two radios is two rows,
+milliseconds apart on the one clock. A receiver for one radio takes the rows tagged to it; a
+receiver for a whole system takes them all and keeps the best-SNR row of each such cluster, so
+the system counts a transmission once however many of its radios heard it. Rows from before
+multiradio was switched on carry no radio id and belong to no radio, so a radio-vs-radio
+comparison starts where the tagging did.
+
+Packets a node originated itself (its adverts, openHop's own requests, a companion app's traffic)
+sit in the same log with RSSI 0 and are not receptions; they are dropped, and when the node did
+send one, the other system's direct copy of it (same hash within 3 s, no upstream hop) is dropped
+too, since the sender could not have heard it. Two radios on one system are deaf together while
+it sends, which cancels out of their comparison. The report says how many such packets there
+were. A transmission is identified by `(packet_hash, path_hash)` — the same payload relayed by
+two different neighbours is two different transmissions — and matched across receivers when the
+timestamps are within 3 s (250 ms within one system). The comparison window is clamped to the
+period where both receivers have data, so a restart on one side doesn't count as missed packets.
+
+When both receivers sit on one system, the checks that exist to tell two boxes apart are dropped
+or reworded: there is one clock (no offset to report), one position (a neighbour only one radio
+hears is its antenna, not where it stands), one repeater mode, and one noise floor and CRC count,
+which both rows show.
 
 Neighbour positions come from the neighbours' own adverts: a MeshCore advert carries the node's
 public key, name and (when set) lat/lon, and a hop hash in a path is the first 1–3 bytes of that
