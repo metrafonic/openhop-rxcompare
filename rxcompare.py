@@ -96,22 +96,26 @@ class Site:
         return out
 
     def radios(self):
-        """The radio ids this system tags its receptions with (openHop's `rx_radio_id`, e.g. "local",
-        "link"). Empty on a single-radio system, or a build too old to report the field, where the site
-        is simply one nameless receiver. Read from the newest page of history, so a radio that has been
-        silent for the whole scan window does not appear."""
+        """The radio ids this system receives on (openHop's `rx_radio_id`, e.g. "local", "link"). Taken
+        from the system's config, so a radio that has heard nothing still shows up — that it heard
+        nothing is the finding. Builds too old to list their radios fall back to the ids tagged on
+        recent history: one on a single-radio system, none before the field existed; either way the
+        site is simply one receiver."""
         if self._radios and time.time() - self._radios[0] < RADIO_SCAN_TTL_S:
             return self._radios[1]
-        ids = set()
+        ids = []
         try:
-            end = time.time()
             # a site that is down should not stall the registry for the full API timeout: it simply
             # offers its one plain receiver until the next scan finds it back
-            d = self.get("bulk_packets", timeout=RADIO_SCAN_TIMEOUT_S, start_timestamp=end - RADIO_SCAN_H * 3600, end_timestamp=end, limit=PAGE)
-            ids = {p["rx_radio_id"] for p in d.get("data", []) if p.get("rx_radio_id")}
+            cfg = self.get("stats", timeout=RADIO_SCAN_TIMEOUT_S).get("config") or {}
+            ids = [r["id"] for r in cfg.get("radios") or [] if r.get("id")]
+            if not ids:
+                end = time.time()
+                d = self.get("bulk_packets", timeout=RADIO_SCAN_TIMEOUT_S, start_timestamp=end - RADIO_SCAN_H * 3600, end_timestamp=end, limit=PAGE)
+                ids = sorted({p["rx_radio_id"] for p in d.get("data", []) if p.get("rx_radio_id")})
         except Exception:
             pass
-        self._radios = (time.time(), sorted(ids))
+        self._radios = (time.time(), ids)
         return self._radios[1]
 
     def mode(self):
@@ -314,14 +318,17 @@ def load_sites(path=None):
 
 def receivers_of(sites):
     """Every receiver the configured sites offer, in a stable order: each radio of a multiradio system,
-    then the system as a whole (all its radios at once). Discovery hits each site's API, so a site that
-    is offline contributes the one plain receiver it would have had."""
+    then the system as a whole (all its radios at once). A site with one radio is offered once, as
+    itself: its one radio and the whole box hear exactly the same packets, and comparing a receiver
+    with itself is meaningless. Discovery hits each site's API, so a site that is offline contributes
+    the one plain receiver it would have had."""
     out = {}
     for s in sites:
         radios = s.radios()
-        for r in radios:
-            rv = Receiver(s, r)
-            out[rv.id] = rv
+        if len(radios) > 1:
+            for r in radios:
+                rv = Receiver(s, r)
+                out[rv.id] = rv
         rv = Receiver(s, None, label=f"{s.label} (all radios)" if len(radios) > 1 else None)
         out[rv.id] = rv
     return out
@@ -1869,7 +1876,7 @@ def render_html(R, nav="", refresh=0):
 
     # ---- neighbour table
     nrows = []
-    mxd = max([abs(n["dsnr"]) for n in R["neighbours"] if n["dsnr"] == n["dsnr"]] or [1])
+    mxd = max([abs(n["dsnr"]) for n in R["neighbours"] if n["dsnr"] == n["dsnr"]] or [0]) or 1   # every dsnr can be 0
     for n in R["neighbours"][:40]:
         if n["dsnr"] == n["dsnr"]:
             w = 60 * abs(n["dsnr"]) / mxd

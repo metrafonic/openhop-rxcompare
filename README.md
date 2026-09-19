@@ -97,8 +97,10 @@ docker compose up -d
 open http://localhost:8090
 ```
 
-That is the two-node setup. For more systems, or to compare the radios of a multiradio one
-separately, list them in a `receivers.yml` and mount it (the line is in `docker-compose.yml`):
+That is the two-node setup. A single multiradio system works there too — with only `A_*` set,
+its radios are compared against each other. For more systems, to name the radios, or to pick
+which pair opens by default, list them in a `receivers.yml` and mount it (the line is in
+`docker-compose.yml`):
 
 ```sh
 cp receivers.example.yml receivers.yml   # one entry per system; keys stay in .env as ${VAR}
@@ -106,9 +108,10 @@ cp receivers.example.yml receivers.yml   # one entry per system; keys stay in .e
 docker compose up -d
 ```
 
-Each system's radios are discovered from its API (openHop tags every reception with
-`rx_radio_id`), so a multiradio box offers one receiver per radio plus one for the box as a
-whole. The report's nav gains an A row and a B row to pick which two to compare.
+Each system's radios are discovered from its API (the radio list in its config, so a radio
+that has heard nothing still shows up — at 0%), and a multiradio box offers one receiver per
+radio plus one for the box as a whole. The report's nav gains an A row and a B row to pick which
+two to compare.
 
 To build the image yourself instead of pulling it:
 

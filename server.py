@@ -41,9 +41,13 @@ def registry():
 
 
 def default_pair():
+    """The two receivers to open with: the configured default if both are on offer, else the first two.
+    Always a pair; None fills in when there is nothing to compare against (one single-radio system)."""
     reg = registry()
     ids = [i for i in (DEFAULT or ()) if i in reg] if DEFAULT else []
-    return tuple(ids[:2]) if len(ids) >= 2 else tuple(list(reg)[:2])
+    if len(ids) < 2:
+        ids = list(reg)[:2]
+    return tuple(ids + [None] * (2 - len(ids)))
 
 
 def nav_html(a, b, hours):
@@ -154,8 +158,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html", "/summary.json"):
             a, b = self.pair(q)
             if not (a and b):
-                return self.send(503, "<h1>no receivers configured</h1><p>Write a receivers.yml "
-                                      "(see receivers.example.yml) or set A_URL/A_KEY/B_URL/B_KEY.</p>")
+                reg = registry()
+                return self.send(503, "<h1>nothing to compare</h1><p>This needs two receivers: two systems, or one "
+                                      f"multiradio system. On offer: {html.escape(', '.join(reg) or 'none')}. "
+                                      "Write a receivers.yml (see receivers.example.yml) or set A_URL/A_KEY/B_URL/B_KEY.</p>")
             if a == b:
                 return self.send(400, f"<h1>pick two different receivers</h1><pre>{html.escape(a)}</pre>")
             try:
